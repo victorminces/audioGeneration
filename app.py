@@ -26,19 +26,13 @@ if os.path.exists(CHECKPOINT):
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def audio_to_tensor(sr, data):
-    """Convert gradio audio tuple to a mono float32 tensor [1, samples]."""
-    if data.dtype == np.int16:
-        data = data.astype(np.float32) / 32768.0
-    elif data.dtype == np.int32:
-        data = data.astype(np.float32) / 2147483648.0
-    else:
-        data = data.astype(np.float32)
-    if data.ndim == 2:
-        data = data.mean(axis=1)
-    waveform = torch.tensor(data).unsqueeze(0)
+def filepath_to_tensor(path):
+    """Load an audio file path to a mono float32 tensor [1, samples]."""
+    waveform, sr = torchaudio.load(path)
     if sr != SAMPLE_RATE:
         waveform = T.Resample(sr, SAMPLE_RATE)(waveform)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
     return waveform
 
 
@@ -49,11 +43,7 @@ def load_clips():
         if not fname.lower().endswith(('.wav', '.mp3', '.flac', '.aif', '.aiff')):
             continue
         try:
-            waveform, sr = torchaudio.load(os.path.join(DATA_DIR, fname))
-            if sr != SAMPLE_RATE:
-                waveform = T.Resample(sr, SAMPLE_RATE)(waveform)
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
+            waveform = filepath_to_tensor(os.path.join(DATA_DIR, fname))
             for start in range(0, waveform.shape[1] - CLIP_LENGTH + 1, CLIP_LENGTH):
                 clips.append(waveform[:, start:start + CLIP_LENGTH])
         except Exception as e:
@@ -70,17 +60,20 @@ def dataset_summary():
 
 # ── tab 1: data ───────────────────────────────────────────────────────────────
 
-def add_audio(audio):
-    if audio is None:
+def add_audio(path):
+    # Gradio 6 passes a file path string for Audio inputs
+    if path is None:
         return "No audio provided.", dataset_summary()
-    sr, data = audio
-    waveform = audio_to_tensor(sr, data)
-    existing = [f for f in os.listdir(DATA_DIR) if f.startswith("recording_")]
-    out_path = os.path.join(DATA_DIR, f"recording_{len(existing):04d}.wav")
-    torchaudio.save(out_path, waveform, SAMPLE_RATE)
-    n_clips = waveform.shape[1] // CLIP_LENGTH
-    msg = f"Saved {waveform.shape[1] / SAMPLE_RATE:.1f}s → {n_clips} clip(s)"
-    return msg, dataset_summary()
+    try:
+        waveform = filepath_to_tensor(path)
+        existing = [f for f in os.listdir(DATA_DIR) if f.startswith("recording_")]
+        out_path = os.path.join(DATA_DIR, f"recording_{len(existing):04d}.wav")
+        torchaudio.save(out_path, waveform, SAMPLE_RATE)
+        n_clips = waveform.shape[1] // CLIP_LENGTH
+        msg = f"Saved {waveform.shape[1] / SAMPLE_RATE:.1f}s → {n_clips} clip(s)"
+        return msg, dataset_summary()
+    except Exception as e:
+        return f"Error: {e}", dataset_summary()
 
 
 # ── tab 2: train ──────────────────────────────────────────────────────────────
@@ -93,7 +86,8 @@ def train_model(num_steps, batch_size):
         yield "No clips found. Add recordings in the Data tab first."
         return
 
-    yield f"Found {len(clips)} clips. Training on {device}...\n"
+    log = f"Found {len(clips)} clips. Training on {device}...\n"
+    yield log
 
     data = torch.stack(clips)
     val_size = max(1, len(clips) // 10)
@@ -109,7 +103,6 @@ def train_model(num_steps, batch_size):
     model = Autoencoder().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    log = f"Found {len(clips)} clips. Training on {device}...\n"
     report_every = max(1, int(num_steps) // 20)
     step = 0
 
@@ -143,58 +136,52 @@ def train_model(num_steps, batch_size):
 
 # ── tab 3: reconstruct ────────────────────────────────────────────────────────
 
-def reconstruct_audio(audio):
-    if audio is None:
+def reconstruct_audio(path):
+    if path is None:
         return None, "No audio provided."
     if not os.path.exists(CHECKPOINT):
         return None, "No trained model found. Train the model first."
 
-    sr, data = audio
-    waveform = audio_to_tensor(sr, data)
+    try:
+        waveform = filepath_to_tensor(path)
+        total = waveform.shape[1]
+        pad = (CLIP_LENGTH - total % CLIP_LENGTH) % CLIP_LENGTH
+        if pad:
+            waveform = F.pad(waveform, (0, pad))
 
-    # Process in non-overlapping 1-second chunks, reconstruct each
-    total = waveform.shape[1]
-    # Pad to multiple of CLIP_LENGTH
-    pad = (CLIP_LENGTH - total % CLIP_LENGTH) % CLIP_LENGTH
-    if pad:
-        waveform = F.pad(waveform, (0, pad))
+        model.eval()
+        chunks_out = []
+        with torch.no_grad():
+            for start in range(0, waveform.shape[1], CLIP_LENGTH):
+                chunk = waveform[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)
+                recon = model(chunk).squeeze(0).cpu()
+                chunks_out.append(recon)
 
-    model.eval()
-    chunks_out = []
-    with torch.no_grad():
-        for start in range(0, waveform.shape[1], CLIP_LENGTH):
-            chunk = waveform[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)
-            recon = model(chunk).squeeze(0).cpu()
-            chunks_out.append(recon)
-
-    output = torch.cat(chunks_out, dim=1)[:, :total]
-    out_np = output.squeeze(0).numpy()
-    n_chunks = len(chunks_out)
-    return (SAMPLE_RATE, out_np), f"Reconstructed {total / SAMPLE_RATE:.2f}s in {n_chunks} chunk(s)."
+        output = torch.cat(chunks_out, dim=1)[:, :total]
+        out_np = output.squeeze(0).numpy()
+        return (SAMPLE_RATE, out_np), f"Reconstructed {total / SAMPLE_RATE:.2f}s in {len(chunks_out)} chunk(s)."
+    except Exception as e:
+        return None, f"Error: {e}"
 
 
 # ── ui ────────────────────────────────────────────────────────────────────────
 
-css = """
-#title { text-align: center; margin-bottom: 0.5em; }
-"""
-
-with gr.Blocks(title="Generative Sound", css=css) as demo:
-    gr.Markdown("# Waveform Autoencoder", elem_id="title")
+with gr.Blocks(title="Generative Sound") as demo:
+    gr.Markdown("# Waveform Autoencoder")
     gr.Markdown(
         "Record or upload sounds → train a compression model → hear what the bottleneck keeps.\n\n"
-        f"**Latent:** 8 channels × 500 time steps = 4,000 units  |  **Device:** {device}"
+        f"**Latent:** 8 ch × 500 time steps = 4,000 units  |  **Device:** {device}"
     )
 
     with gr.Tab("1 · Data"):
         gr.Markdown(
             "Upload files or record directly. Long recordings are chopped into 1-second clips automatically."
         )
-        audio_in = gr.Audio(sources=["upload", "microphone"], label="Audio")
+        audio_in = gr.Audio(sources=["upload", "microphone"], label="Audio", type="filepath")
         add_btn = gr.Button("Add to training data", variant="primary")
         add_msg = gr.Textbox(label="Status", interactive=False)
         with gr.Row():
-            info_box = gr.Textbox(label="Dataset", value=dataset_summary, interactive=False)
+            info_box = gr.Textbox(label="Dataset", value=dataset_summary(), interactive=False)
             refresh_btn = gr.Button("Refresh", scale=0)
 
         add_btn.click(add_audio, inputs=audio_in, outputs=[add_msg, info_box])
@@ -211,11 +198,11 @@ with gr.Blocks(title="Generative Sound", css=css) as demo:
 
     with gr.Tab("3 · Reconstruct"):
         gr.Markdown(
-            "Upload or record a sound. The model compresses it through the bottleneck and reconstructs it.\n"
+            "Upload or record a sound. The model compresses it through the bottleneck and reconstructs it. "
             "Listen to what changed."
         )
         with gr.Row():
-            recon_in = gr.Audio(sources=["upload", "microphone"], label="Input")
+            recon_in = gr.Audio(sources=["upload", "microphone"], label="Input", type="filepath")
             recon_out = gr.Audio(label="Reconstructed", interactive=False)
         recon_btn = gr.Button("Reconstruct", variant="primary")
         recon_msg = gr.Textbox(label="Info", interactive=False)
