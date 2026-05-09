@@ -1,8 +1,8 @@
 import os
 import torch
 from torch.utils.data import Dataset
-import torchaudio
 import torchaudio.transforms as T
+import soundfile as sf
 
 
 SAMPLE_RATE = 16000
@@ -18,7 +18,8 @@ class AudioDataset(Dataset):
         print(f"Dataset: {len(self.clips)} clips from {folder}")
 
     def _load_file(self, path):
-        waveform, sr = torchaudio.load(path, backend="soundfile")
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        waveform = torch.tensor(data.T)  # (channels, samples)
         if sr != SAMPLE_RATE:
             waveform = T.Resample(sr, SAMPLE_RATE)(waveform)
         if waveform.shape[0] > 1:

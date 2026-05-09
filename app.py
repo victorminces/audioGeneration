@@ -3,8 +3,8 @@ import io
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-import torchaudio
 import torchaudio.transforms as T
+import soundfile as sf
 import numpy as np
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
@@ -25,12 +25,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def load_waveform(source):
-    """Load a waveform from a file path or bytes object."""
+    """Load a waveform from a file path, file-like object, or bytes."""
     if isinstance(source, bytes):
-        buf = io.BytesIO(source)
-        waveform, sr = torchaudio.load(buf, backend="soundfile")
-    else:
-        waveform, sr = torchaudio.load(source, backend="soundfile")
+        source = io.BytesIO(source)
+    data, sr = sf.read(source, dtype="float32", always_2d=True)
+    waveform = torch.tensor(data.T)  # (channels, samples)
     if sr != SAMPLE_RATE:
         waveform = T.Resample(sr, SAMPLE_RATE)(waveform)
     if waveform.shape[0] > 1:
@@ -55,7 +54,7 @@ def load_clips():
 def save_audio(waveform):
     existing = [f for f in os.listdir(DATA_DIR) if f.startswith("recording_")]
     path = os.path.join(DATA_DIR, f"recording_{len(existing):04d}.wav")
-    torchaudio.save(path, waveform, SAMPLE_RATE)
+    sf.write(path, waveform.numpy().T, SAMPLE_RATE)
     return path
 
 
@@ -69,7 +68,7 @@ def get_model():
 
 def tensor_to_bytes(waveform):
     buf = io.BytesIO()
-    torchaudio.save(buf, waveform, SAMPLE_RATE, format="wav")
+    sf.write(buf, waveform.numpy().T, SAMPLE_RATE, format="WAV")
     buf.seek(0)
     return buf.read()
 
