@@ -1,11 +1,13 @@
 import os
+import io
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torchaudio
 import torchaudio.transforms as T
 import numpy as np
-import gradio as gr
+import streamlit as st
+from audio_recorder_streamlit import audio_recorder
 
 from model import Autoencoder
 from dataset import SAMPLE_RATE, CLIP_LENGTH
@@ -18,17 +20,17 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = Autoencoder().to(device)
-if os.path.exists(CHECKPOINT):
-    model.load_state_dict(torch.load(CHECKPOINT, map_location=device))
-    model.eval()
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-def filepath_to_tensor(path):
-    """Load an audio file path to a mono float32 tensor [1, samples]."""
-    waveform, sr = torchaudio.load(path)
+def load_waveform(source):
+    """Load a waveform from a file path or bytes object."""
+    if isinstance(source, bytes):
+        buf = io.BytesIO(source)
+        waveform, sr = torchaudio.load(buf)
+    else:
+        waveform, sr = torchaudio.load(source)
     if sr != SAMPLE_RATE:
         waveform = T.Resample(sr, SAMPLE_RATE)(waveform)
     if waveform.shape[0] > 1:
@@ -37,175 +39,208 @@ def filepath_to_tensor(path):
 
 
 def load_clips():
-    """Load all audio files in data/raw/ and slice into 1-second clips."""
     clips = []
     for fname in sorted(os.listdir(DATA_DIR)):
         if not fname.lower().endswith(('.wav', '.mp3', '.flac', '.aif', '.aiff')):
             continue
         try:
-            waveform = filepath_to_tensor(os.path.join(DATA_DIR, fname))
+            waveform = load_waveform(os.path.join(DATA_DIR, fname))
             for start in range(0, waveform.shape[1] - CLIP_LENGTH + 1, CLIP_LENGTH):
                 clips.append(waveform[:, start:start + CLIP_LENGTH])
         except Exception as e:
-            print(f"Skipping {fname}: {e}")
+            st.warning(f"Skipping {fname}: {e}")
     return clips
 
 
-def dataset_summary():
-    files = [f for f in os.listdir(DATA_DIR)
-             if f.lower().endswith(('.wav', '.mp3', '.flac', '.aif', '.aiff'))]
-    clips = load_clips()
-    return f"{len(files)} file(s) → {len(clips)} one-second clip(s)"
+def save_audio(waveform):
+    existing = [f for f in os.listdir(DATA_DIR) if f.startswith("recording_")]
+    path = os.path.join(DATA_DIR, f"recording_{len(existing):04d}.wav")
+    torchaudio.save(path, waveform, SAMPLE_RATE)
+    return path
 
 
-# ── tab 1: data ───────────────────────────────────────────────────────────────
-
-def add_audio(path):
-    # Gradio 6 passes a file path string for Audio inputs
-    if path is None:
-        return "No audio provided.", dataset_summary()
-    try:
-        waveform = filepath_to_tensor(path)
-        existing = [f for f in os.listdir(DATA_DIR) if f.startswith("recording_")]
-        out_path = os.path.join(DATA_DIR, f"recording_{len(existing):04d}.wav")
-        torchaudio.save(out_path, waveform, SAMPLE_RATE)
-        n_clips = waveform.shape[1] // CLIP_LENGTH
-        msg = f"Saved {waveform.shape[1] / SAMPLE_RATE:.1f}s → {n_clips} clip(s)"
-        return msg, dataset_summary()
-    except Exception as e:
-        return f"Error: {e}", dataset_summary()
+def get_model():
+    m = Autoencoder().to(device)
+    if os.path.exists(CHECKPOINT):
+        m.load_state_dict(torch.load(CHECKPOINT, map_location=device, weights_only=True))
+    m.eval()
+    return m
 
 
-# ── tab 2: train ──────────────────────────────────────────────────────────────
-
-def train_model(num_steps, batch_size):
-    global model
-
-    clips = load_clips()
-    if not clips:
-        yield "No clips found. Add recordings in the Data tab first."
-        return
-
-    log = f"Found {len(clips)} clips. Training on {device}...\n"
-    yield log
-
-    data = torch.stack(clips)
-    val_size = max(1, len(clips) // 10)
-    perm = torch.randperm(len(clips))
-    train_data = data[perm[val_size:]]
-    val_data = data[perm[:val_size]]
-
-    bs = int(batch_size)
-    train_loader = DataLoader(train_data, batch_size=bs, shuffle=True,
-                              drop_last=len(train_data) >= bs)
-    val_loader = DataLoader(val_data, batch_size=bs)
-
-    model = Autoencoder().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    report_every = max(1, int(num_steps) // 20)
-    step = 0
-
-    while step < int(num_steps):
-        model.train()
-        for batch in train_loader:
-            if step >= int(num_steps):
-                break
-            batch = batch.to(device)
-            recon = model(batch)
-            loss = F.l1_loss(recon, batch)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            step += 1
-
-            if step % report_every == 0 or step == int(num_steps):
-                model.eval()
-                with torch.no_grad():
-                    v = [F.l1_loss(model(b.to(device)), b.to(device)).item()
-                         for b in val_loader]
-                val_loss = sum(v) / len(v)
-                model.train()
-                log += f"step {step:5d}/{int(num_steps)} | train {loss.item():.4f} | val {val_loss:.4f}\n"
-                yield log
-
-    torch.save(model.state_dict(), CHECKPOINT)
-    log += f"\nDone. Checkpoint saved to {CHECKPOINT}"
-    yield log
-
-
-# ── tab 3: reconstruct ────────────────────────────────────────────────────────
-
-def reconstruct_audio(path):
-    if path is None:
-        return None, "No audio provided."
-    if not os.path.exists(CHECKPOINT):
-        return None, "No trained model found. Train the model first."
-
-    try:
-        waveform = filepath_to_tensor(path)
-        total = waveform.shape[1]
-        pad = (CLIP_LENGTH - total % CLIP_LENGTH) % CLIP_LENGTH
-        if pad:
-            waveform = F.pad(waveform, (0, pad))
-
-        model.eval()
-        chunks_out = []
-        with torch.no_grad():
-            for start in range(0, waveform.shape[1], CLIP_LENGTH):
-                chunk = waveform[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)
-                recon = model(chunk).squeeze(0).cpu()
-                chunks_out.append(recon)
-
-        output = torch.cat(chunks_out, dim=1)[:, :total]
-        out_np = output.squeeze(0).numpy()
-        return (SAMPLE_RATE, out_np), f"Reconstructed {total / SAMPLE_RATE:.2f}s in {len(chunks_out)} chunk(s)."
-    except Exception as e:
-        return None, f"Error: {e}"
+def tensor_to_bytes(waveform):
+    buf = io.BytesIO()
+    torchaudio.save(buf, waveform, SAMPLE_RATE, format="wav")
+    buf.seek(0)
+    return buf.read()
 
 
 # ── ui ────────────────────────────────────────────────────────────────────────
 
-with gr.Blocks(title="Generative Sound") as demo:
-    gr.Markdown("# Waveform Autoencoder")
-    gr.Markdown(
-        "Record or upload sounds → train a compression model → hear what the bottleneck keeps.\n\n"
-        f"**Latent:** 8 ch × 500 time steps = 4,000 units  |  **Device:** {device}"
-    )
+st.set_page_config(page_title="Generative Sound", layout="wide")
+st.title("Waveform Autoencoder")
+st.caption(
+    f"Record or upload sounds → train a compression model → hear what the bottleneck keeps. "
+    f"**Latent:** 8 ch × 500 steps = 4,000 units  |  **Device:** {device}"
+)
 
-    with gr.Tab("1 · Data"):
-        gr.Markdown(
-            "Upload files or record directly. Long recordings are chopped into 1-second clips automatically."
-        )
-        audio_in = gr.Audio(sources=["upload", "microphone"], label="Audio", type="filepath")
-        add_btn = gr.Button("Add to training data", variant="primary")
-        add_msg = gr.Textbox(label="Status", interactive=False)
-        with gr.Row():
-            info_box = gr.Textbox(label="Dataset", value=dataset_summary(), interactive=False)
-            refresh_btn = gr.Button("Refresh", scale=0)
+tab1, tab2, tab3 = st.tabs(["1 · Data", "2 · Train", "3 · Reconstruct"])
 
-        add_btn.click(add_audio, inputs=audio_in, outputs=[add_msg, info_box])
-        refresh_btn.click(dataset_summary, outputs=info_box)
 
-    with gr.Tab("2 · Train"):
-        gr.Markdown("Train the autoencoder on your recordings. Loss should decrease over steps.")
-        with gr.Row():
-            steps_sl = gr.Slider(100, 10000, value=1000, step=100, label="Steps")
-            batch_sl = gr.Slider(4, 64, value=16, step=4, label="Batch size")
-        train_btn = gr.Button("Train", variant="primary")
-        train_log = gr.Textbox(label="Log", lines=18, interactive=False, max_lines=18)
-        train_btn.click(train_model, inputs=[steps_sl, batch_sl], outputs=train_log)
+# ── tab 1: data ───────────────────────────────────────────────────────────────
 
-    with gr.Tab("3 · Reconstruct"):
-        gr.Markdown(
-            "Upload or record a sound. The model compresses it through the bottleneck and reconstructs it. "
-            "Listen to what changed."
-        )
-        with gr.Row():
-            recon_in = gr.Audio(sources=["upload", "microphone"], label="Input", type="filepath")
-            recon_out = gr.Audio(label="Reconstructed", interactive=False)
-        recon_btn = gr.Button("Reconstruct", variant="primary")
-        recon_msg = gr.Textbox(label="Info", interactive=False)
-        recon_btn.click(reconstruct_audio, inputs=recon_in, outputs=[recon_out, recon_msg])
+with tab1:
+    st.subheader("Add audio to your training set")
+    st.write("Upload a file or record directly. Long recordings are chopped into 1-second clips.")
 
-demo.launch()
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**Upload a file**")
+        uploaded = st.file_uploader("Audio file", type=["wav", "mp3", "flac", "aif", "aiff"],
+                                    label_visibility="collapsed")
+        if uploaded:
+            st.audio(uploaded)
+            if st.button("Add uploaded file", key="add_upload"):
+                waveform = load_waveform(uploaded.read())
+                path = save_audio(waveform)
+                n = waveform.shape[1] // CLIP_LENGTH
+                st.success(f"Saved {waveform.shape[1] / SAMPLE_RATE:.1f}s → {n} clip(s)")
+
+    with col2:
+        st.markdown("**Record from microphone**")
+        audio_bytes = audio_recorder(text="Click to record", pause_threshold=3.0, key="recorder")
+        if audio_bytes:
+            st.audio(audio_bytes, format="audio/wav")
+            if st.button("Add recording", key="add_rec"):
+                waveform = load_waveform(audio_bytes)
+                path = save_audio(waveform)
+                n = waveform.shape[1] // CLIP_LENGTH
+                st.success(f"Saved {waveform.shape[1] / SAMPLE_RATE:.1f}s → {n} clip(s)")
+
+    st.divider()
+    clips = load_clips()
+    files = [f for f in os.listdir(DATA_DIR)
+             if f.lower().endswith(('.wav', '.mp3', '.flac', '.aif', '.aiff'))]
+    c1, c2 = st.columns(2)
+    c1.metric("Files in dataset", len(files))
+    c2.metric("1-second clips", len(clips))
+
+
+# ── tab 2: train ──────────────────────────────────────────────────────────────
+
+with tab2:
+    st.subheader("Train the autoencoder")
+    st.write("Loss should decrease over steps. Lower = better reconstruction.")
+
+    col1, col2 = st.columns(2)
+    num_steps = col1.slider("Steps", 100, 10000, 1000, 100)
+    batch_size = col2.slider("Batch size", 4, 64, 16, 4)
+
+    if st.button("Train", type="primary"):
+        clips = load_clips()
+        if not clips:
+            st.error("No clips found. Add recordings in the Data tab first.")
+        else:
+            data = torch.stack(clips)
+            val_size = max(1, len(clips) // 10)
+            perm = torch.randperm(len(clips))
+            train_data = data[perm[val_size:]]
+            val_data = data[perm[:val_size]]
+
+            bs = int(batch_size)
+            train_loader = DataLoader(train_data, batch_size=bs, shuffle=True,
+                                      drop_last=len(train_data) >= bs)
+            val_loader = DataLoader(val_data, batch_size=bs)
+
+            model = Autoencoder().to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            progress = st.progress(0.0, text="Starting...")
+            log_area = st.empty()
+            log_lines = [f"Found {len(clips)} clips. Training on {device}..."]
+
+            report_every = max(1, num_steps // 20)
+            step = 0
+
+            while step < num_steps:
+                model.train()
+                for batch in train_loader:
+                    if step >= num_steps:
+                        break
+                    batch = batch.to(device)
+                    recon = model(batch)
+                    loss = F.l1_loss(recon, batch)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    step += 1
+
+                    if step % report_every == 0 or step == num_steps:
+                        model.eval()
+                        with torch.no_grad():
+                            v = [F.l1_loss(model(b.to(device)), b.to(device)).item()
+                                 for b in val_loader]
+                        val_loss = sum(v) / len(v)
+                        model.train()
+                        log_lines.append(
+                            f"step {step:5d}/{num_steps} | train {loss.item():.4f} | val {val_loss:.4f}"
+                        )
+                        progress.progress(step / num_steps,
+                                          text=f"Step {step}/{num_steps} — loss {loss.item():.4f}")
+                        log_area.code("\n".join(log_lines))
+
+            os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+            torch.save(model.state_dict(), CHECKPOINT)
+            progress.progress(1.0, text="Done!")
+            log_lines.append(f"\nCheckpoint saved to {CHECKPOINT}")
+            log_area.code("\n".join(log_lines))
+            st.success("Training complete. Go to the Reconstruct tab to hear the results.")
+
+
+# ── tab 3: reconstruct ────────────────────────────────────────────────────────
+
+with tab3:
+    st.subheader("Hear what the bottleneck kept")
+    st.write("Upload or record a sound. The model compresses and reconstructs it.")
+
+    if not os.path.exists(CHECKPOINT):
+        st.warning("No trained model found. Train the model first.")
+    else:
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Input**")
+            r_upload = st.file_uploader("Upload to reconstruct", type=["wav", "mp3", "flac"],
+                                        key="r_upload", label_visibility="collapsed")
+            r_recorded = audio_recorder(text="Or record", pause_threshold=3.0, key="r_recorder")
+
+            source = None
+            if r_upload:
+                source = r_upload.read()
+                st.audio(source, format="audio/wav")
+            elif r_recorded:
+                source = r_recorded
+                st.audio(source, format="audio/wav")
+
+        with col2:
+            st.markdown("**Reconstructed**")
+            if source and st.button("Reconstruct", type="primary"):
+                try:
+                    waveform = load_waveform(source)
+                    total = waveform.shape[1]
+                    pad = (CLIP_LENGTH - total % CLIP_LENGTH) % CLIP_LENGTH
+                    if pad:
+                        waveform = F.pad(waveform, (0, pad))
+
+                    model = get_model()
+                    chunks_out = []
+                    with torch.no_grad():
+                        for start in range(0, waveform.shape[1], CLIP_LENGTH):
+                            chunk = waveform[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)
+                            chunks_out.append(model(chunk).squeeze(0).cpu())
+
+                    output = torch.cat(chunks_out, dim=1)[:, :total]
+                    st.audio(tensor_to_bytes(output), format="audio/wav")
+                    st.caption(f"{total / SAMPLE_RATE:.2f}s reconstructed in {len(chunks_out)} chunk(s)")
+                except Exception as e:
+                    st.error(f"Error: {e}")

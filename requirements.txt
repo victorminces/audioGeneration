@@ -1,3 +1,4 @@
 torch
 torchaudio
-gradio
+streamlit
+audio-recorder-streamlit
