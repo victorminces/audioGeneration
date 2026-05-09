@@ -18,7 +18,7 @@ class AudioDataset(Dataset):
         print(f"Dataset: {len(self.clips)} clips from {folder}")
 
     def _load_file(self, path):
-        waveform, sr = torchaudio.load(path)
+        waveform, sr = torchaudio.load(path, backend="soundfile")
         if sr != SAMPLE_RATE:
             waveform = T.Resample(sr, SAMPLE_RATE)(waveform)
         if waveform.shape[0] > 1:

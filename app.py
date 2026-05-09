@@ -28,9 +28,9 @@ def load_waveform(source):
     """Load a waveform from a file path or bytes object."""
     if isinstance(source, bytes):
         buf = io.BytesIO(source)
-        waveform, sr = torchaudio.load(buf)
+        waveform, sr = torchaudio.load(buf, backend="soundfile")
     else:
-        waveform, sr = torchaudio.load(source)
+        waveform, sr = torchaudio.load(source, backend="soundfile")
     if sr != SAMPLE_RATE:
         waveform = T.Resample(sr, SAMPLE_RATE)(waveform)
     if waveform.shape[0] > 1:
