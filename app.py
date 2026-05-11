@@ -178,12 +178,12 @@ but a tiny latent will always lose some detail — that's the point.
 
 st.set_page_config(page_title="Generative Sound", layout="wide")
 st.title("Waveform Autoencoder")
-st.caption(f"Device: {device}  |  Sample rate: {SAMPLE_RATE} Hz  |  Clip length: 1 second")
+st.caption(f"Device: {device}  |  Sample rate: {SAMPLE_RATE} Hz  |  Clip length: 50ms")
 
 with st.expander("How does this network work? (architecture + loss function)"):
     st.markdown(ARCH_EXPLANATION)
 
-tab1, tab2, tab3 = st.tabs(["1 · Data", "2 · Train", "3 · Compare & Reconstruct"])
+tab1, tab2, tab3, tab4 = st.tabs(["1 · Data", "2 · Train", "3 · Compare & Reconstruct", "4 · Interpolate"])
 
 
 # ── tab 1: data ───────────────────────────────────────────────────────────────
@@ -381,6 +381,43 @@ with tab2:
 
 # ── tab 3: compare & reconstruct ─────────────────────────────────────────────
 
+def interpolate_sounds(model, source_a, source_b, n_steps):
+    wav_a = load_waveform(source_a)
+    wav_b = load_waveform(source_b)
+
+    # truncate the longest to match the shorter
+    min_len = min(wav_a.shape[1], wav_b.shape[1])
+    wav_a = wav_a[:, :min_len]
+    wav_b = wav_b[:, :min_len]
+
+    # pad both to a multiple of CLIP_LENGTH
+    pad = (CLIP_LENGTH - min_len % CLIP_LENGTH) % CLIP_LENGTH
+    if pad:
+        wav_a = F.pad(wav_a, (0, pad))
+        wav_b = F.pad(wav_b, (0, pad))
+
+    model.eval()
+    with torch.no_grad():
+        # encode every clip for A and B
+        z_a, z_b = [], []
+        for start in range(0, wav_a.shape[1], CLIP_LENGTH):
+            z_a.append(model.encode(wav_a[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)))
+            z_b.append(model.encode(wav_b[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)))
+
+        # for each alpha, interpolate latents and decode
+        results = []
+        for i in range(n_steps):
+            alpha = i / (n_steps - 1) if n_steps > 1 else 0.0
+            chunks = []
+            for za, zb in zip(z_a, z_b):
+                z = (1 - alpha) * za + alpha * zb
+                chunks.append(model.decode(z).squeeze(0).cpu())
+            audio = torch.cat(chunks, dim=1)[:, :min_len]
+            results.append((alpha, audio))
+
+    return results
+
+
 def rms(waveform):
     return float(waveform.pow(2).mean().sqrt())
 
@@ -475,3 +512,62 @@ with tab3:
                            f"(input was {src_rms_val:.4f})")
                 if src_rms_val > 0.001 and out_rms < 0.001:
                     st.warning("Output is near-silence — the model may have been trained on silence.")
+
+
+# ── tab 4: interpolate ────────────────────────────────────────────────────────
+
+with tab4:
+    st.subheader("Interpolate between two sounds")
+    st.write(
+        "Each sound is encoded clip by clip (50ms chunks). "
+        "Latents are interpolated at each α step and decoded back to audio. "
+        "The longer sound is truncated to match the shorter."
+    )
+
+    saved = list_saved_models()
+    if not saved:
+        st.warning("No trained models yet. Train at least one in the Train tab.")
+    else:
+        col_cfg, _ = st.columns([2, 1])
+        with col_cfg:
+            interp_model_name = st.selectbox("Model", [m["name"] for m in saved], key="interp_model")
+            n_steps = st.slider("Number of steps", min_value=3, max_value=10, value=5,
+                                help="Includes α=0 (sound A) and α=1 (sound B)")
+
+        st.divider()
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            st.markdown("**Sound A** (α = 0.0)")
+            up_a = st.file_uploader("Upload A", type=["wav", "flac"], key="interp_a",
+                                    label_visibility="collapsed")
+            rec_a = audio_recorder(text="Or record A", pause_threshold=3.0, key="interp_rec_a")
+            source_a = up_a.read() if up_a else (rec_a if rec_a else None)
+            if source_a:
+                st.audio(source_a, format="audio/wav")
+
+        with col_b:
+            st.markdown("**Sound B** (α = 1.0)")
+            up_b = st.file_uploader("Upload B", type=["wav", "flac"], key="interp_b",
+                                    label_visibility="collapsed")
+            rec_b = audio_recorder(text="Or record B", pause_threshold=3.0, key="interp_rec_b")
+            source_b = up_b.read() if up_b else (rec_b if rec_b else None)
+            if source_b:
+                st.audio(source_b, format="audio/wav")
+
+        if source_a and source_b and st.button("Interpolate", type="primary"):
+            try:
+                cfg = next(m for m in saved if m["name"] == interp_model_name)
+                m = load_model(cfg)
+                results = interpolate_sounds(m, source_a, source_b, n_steps)
+
+                st.divider()
+                st.markdown("**Results** — play each step to hear the path through latent space")
+                cols = st.columns(len(results))
+                for col, (alpha, audio) in zip(cols, results):
+                    with col:
+                        label = "A" if alpha == 0.0 else ("B" if alpha == 1.0 else f"α={alpha:.2f}")
+                        st.caption(label)
+                        st.audio(tensor_to_bytes(audio), format="audio/wav")
+            except Exception as e:
+                st.error(f"Error: {e}")
