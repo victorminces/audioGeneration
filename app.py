@@ -306,6 +306,7 @@ with tab2:
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
             progress = st.progress(0.0, text="Starting...")
+            chart = st.line_chart({"train loss": [], "val loss": []}, height=250)
             log_area = st.empty()
             log_lines = [f"Found {len(clips)} clips | latent {latent_ch} ch | device {device}"]
 
@@ -331,6 +332,7 @@ with tab2:
                                  for b in val_loader]
                         val_loss = sum(v) / len(v)
                         model.train()
+                        chart.add_rows({"train loss": [loss.item()], "val loss": [val_loss]})
                         log_lines.append(
                             f"step {step:5d}/{num_steps} | "
                             f"train {loss.item():.4f} | val {val_loss:.4f}"
