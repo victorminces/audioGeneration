@@ -6,7 +6,7 @@ import soundfile as sf
 
 
 SAMPLE_RATE = 16000
-CLIP_LENGTH = 16000  # 1 second
+CLIP_LENGTH = 800    # 50 ms
 
 
 class AudioDataset(Dataset):

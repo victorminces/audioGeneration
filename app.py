@@ -113,30 +113,28 @@ If the reconstruction sounds close to the original, the bottleneck learned somet
 
 | Layer | Input | Output | What happens |
 |---|---|---|---|
-| Conv1D | 1 ch × 16,000 | 16 ch × 8,000 | 16 filters learn simple patterns (edges, rumbles...) |
-| Conv1D | 16 ch × 8,000 | 32 ch × 4,000 | 32 filters combine those patterns |
-| Conv1D | 32 ch × 4,000 | 64 ch × 2,000 | richer features, shorter sequence |
-| Conv1D | 64 ch × 2,000 | 32 ch × 1,000 | starts narrowing channels |
-| Conv1D | 32 ch × 1,000 | **N ch × 500** | **latent — this is the bottleneck** |
+| Conv1D | 1 ch × 800 | 16 ch × 400 | 16 filters learn simple patterns (edges, rumbles...) |
+| Conv1D | 16 ch × 400 | 32 ch × 200 | 32 filters combine those patterns |
+| Conv1D | 32 ch × 200 | 64 ch × 100 | richer features, shorter sequence |
+| Conv1D | 64 ch × 100 | **N ch × 50** | **latent — this is the bottleneck** |
 
 Each layer uses **stride 2** — the filter jumps two steps at a time, halving the time axis.
 The filters start random and are shaped by backprop during training.
 
 ---
 
-**Latent space** — `N channels × 500 time positions`
+**Latent space** — `N channels × 50 time positions`
 
 - N is the latent channel count you set before training.
-- Each of the 500 positions corresponds to a ~32ms window of the original audio.
-- Total units = N × 500. Smaller N = more compression = harder reconstruction.
+- Each of the 50 positions corresponds to a 1ms window of the 50ms clip.
+- Total units = N × 50. Smaller N = more compression = harder reconstruction.
 
 ---
 
 **Decoder** — mirror image of the encoder, using ConvTranspose1D to upsample:
 
 ```
-N ch × 500  →  32 ch × 1,000  →  64 ch × 2,000  →  32 ch × 4,000
-            →  16 ch × 8,000  →   1 ch × 16,000
+N ch × 50  →  64 ch × 100  →  32 ch × 200  →  16 ch × 400  →  1 ch × 800
 ```
 
 The decoder is **not** undoing the encoder — it's a separate set of learned filters
@@ -272,18 +270,19 @@ with tab2:
                                  help="Used as the filename. No spaces.")
     latent_ch = col2.select_slider("Latent channels (N)",
                                    options=[2, 4, 8, 16, 32],
-                                   value=8,
-                                   help="N × 500 = total latent units. Smaller = more compression.")
+                                   value=2,
+                                   help="N × 50 = total latent units. Smaller = more compression.")
     num_steps = col3.slider("Training steps", 100, 10000, 1000, 100)
 
     col4, _ = st.columns([1, 2])
     batch_size = col4.slider("Batch size", 4, 64, 16, 4)
 
-    latent_units = latent_ch * 500
-    compression = round(16000 / latent_units, 1)
+    latent_units = latent_ch * 50
+    compression = round(CLIP_LENGTH / latent_units, 1)
     st.info(
-        f"Latent: **{latent_ch} ch × 500 steps = {latent_units} units**  "
-        f"({compression}× compression of 16,000-sample input)"
+        f"Clip: **{CLIP_LENGTH} samples (50ms)**  |  "
+        f"Latent: **{latent_ch} ch × 50 steps = {latent_units} units**  |  "
+        f"**{compression}× compression**"
     )
 
     if st.button("Train", type="primary"):
@@ -347,6 +346,7 @@ with tab2:
                 "filename": pt_file,
                 "latent_ch": latent_ch,
                 "latent_units": latent_units,
+                "clip_length": CLIP_LENGTH,
                 "steps": num_steps,
                 "clips_used": len(clips),
             }
@@ -379,6 +379,15 @@ with tab2:
 
 # ── tab 3: compare & reconstruct ─────────────────────────────────────────────
 
+def rms(waveform):
+    return float(waveform.pow(2).mean().sqrt())
+
+
+# Persist reconstructions across reruns
+for key in ("recon_a", "recon_b"):
+    if key not in st.session_state:
+        st.session_state[key] = None
+
 with tab3:
     st.subheader("Compare models")
     st.write("Select up to two trained models and hear how each reconstructs the same sound.")
@@ -398,46 +407,69 @@ with tab3:
             r_recorded = audio_recorder(text="Or record", pause_threshold=3.0, key="r_recorder")
 
         source = None
+        source_waveform = None
         if r_upload:
             source = r_upload.read()
-            st.audio(source, format="audio/wav")
         elif r_recorded:
             source = r_recorded
+
+        if source:
+            source_waveform = load_waveform(source)
+            src_rms = rms(source_waveform)
             st.audio(source, format="audio/wav")
+            st.caption(f"Input amplitude (RMS): **{src_rms:.4f}**")
 
         st.divider()
 
         col_a, col_b = st.columns(2)
 
         with col_a:
-            st.markdown("**Model A**")
+            st.markdown("**Model A — reconstruction**")
             sel_a = st.selectbox("Select model A", model_names, key="sel_a")
             cfg_a = next(m for m in saved if m["name"] == sel_a)
             st.caption(
-                f"Latent: {cfg_a['latent_ch']} ch × 500 = {cfg_a['latent_units']} units  |  "
+                f"Latent: {cfg_a['latent_ch']} ch × 50 = {cfg_a['latent_units']} units  |  "
                 f"Steps: {cfg_a['steps']}"
             )
             if source and st.button("Reconstruct with A", type="primary"):
                 try:
                     m = load_model(cfg_a)
                     out = reconstruct(m, source)
-                    st.audio(tensor_to_bytes(out), format="audio/wav")
+                    st.session_state.recon_a = (tensor_to_bytes(out), rms(out))
                 except Exception as e:
                     st.error(f"Error: {e}")
 
+            if st.session_state.recon_a:
+                audio_bytes, out_rms = st.session_state.recon_a
+                st.audio(audio_bytes, format="audio/wav")
+                src_rms_val = rms(source_waveform) if source_waveform is not None else 0
+                st.caption(f"Output amplitude (RMS): **{out_rms:.4f}**  "
+                           f"(input was {src_rms_val:.4f})")
+                if src_rms_val > 0.001 and out_rms < 0.001:
+                    st.warning("Output is near-silence — the model may have been trained on silence.")
+
         with col_b:
-            st.markdown("**Model B**")
+            st.markdown("**Model B — reconstruction**")
             default_b = min(1, len(model_names) - 1)
             sel_b = st.selectbox("Select model B", model_names, index=default_b, key="sel_b")
             cfg_b = next(m for m in saved if m["name"] == sel_b)
             st.caption(
-                f"Latent: {cfg_b['latent_ch']} ch × 500 = {cfg_b['latent_units']} units  |  "
+                f"Latent: {cfg_b['latent_ch']} ch × 50 = {cfg_b['latent_units']} units  |  "
                 f"Steps: {cfg_b['steps']}"
             )
             if source and st.button("Reconstruct with B", type="primary"):
                 try:
                     m = load_model(cfg_b)
                     out = reconstruct(m, source)
-                    st.audio(tensor_to_bytes(out), format="audio/wav")
+                    st.session_state.recon_b = (tensor_to_bytes(out), rms(out))
                 except Exception as e:
                     st.error(f"Error: {e}")
+
+            if st.session_state.recon_b:
+                audio_bytes, out_rms = st.session_state.recon_b
+                st.audio(audio_bytes, format="audio/wav")
+                src_rms_val = rms(source_waveform) if source_waveform is not None else 0
+                st.caption(f"Output amplitude (RMS): **{out_rms:.4f}**  "
+                           f"(input was {src_rms_val:.4f})")
+                if src_rms_val > 0.001 and out_rms < 0.001:
+                    st.warning("Output is near-silence — the model may have been trained on silence.")
