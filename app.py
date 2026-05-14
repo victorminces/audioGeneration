@@ -2,6 +2,11 @@ import os
 import io
 import json
 import glob
+import shutil
+import random
+import tarfile
+import tempfile
+import requests
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -11,7 +16,7 @@ import numpy as np
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
 
-from model import Autoencoder
+from model import Autoencoder, VAE
 from dataset import SAMPLE_RATE, CLIP_LENGTH
 
 DATA_DIR = "data/raw"
@@ -78,7 +83,9 @@ def list_saved_models():
 
 
 def load_model(cfg):
-    m = Autoencoder(latent_ch=cfg["latent_ch"]).to(device)
+    model_type = cfg.get("model_type", "ae")
+    cls = VAE if model_type == "vae" else Autoencoder
+    m = cls(latent_ch=cfg["latent_ch"]).to(device)
     pt_path = os.path.join(CHECKPOINT_DIR, cfg["filename"])
     m.load_state_dict(torch.load(pt_path, map_location=device, weights_only=True))
     m.eval()
@@ -95,7 +102,7 @@ def reconstruct(model, source):
     with torch.no_grad():
         for start in range(0, waveform.shape[1], CLIP_LENGTH):
             chunk = waveform[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)
-            chunks.append(model(chunk).squeeze(0).cpu())
+            chunks.append(model.decode(model.encode(chunk)).squeeze(0).cpu())
     return torch.cat(chunks, dim=1)[:, :total]
 
 
@@ -174,6 +181,104 @@ but a tiny latent will always lose some detail — that's the point.
 """
 
 
+# ── public datasets ───────────────────────────────────────────────────────────
+
+DATASETS = {
+    "LibriSpeech test-clean — 346 MB — English speech, multiple speakers": {
+        "url": "https://www.openslr.org/resources/12/test-clean.tar.gz",
+        "ext": (".flac", ".wav"),
+    },
+    "Google Speech Commands v0.01 — 1.4 GB — spoken words (yes/no/stop/go...)": {
+        "url": "http://download.tensorflow.org/data/speech_commands_v0.01.tar.gz",
+        "ext": (".wav",),
+    },
+    "NSynth test — 1.4 GB — musical instrument notes": {
+        "url": "http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-test.jsonwav.tar.gz",
+        "ext": (".wav",),
+    },
+}
+
+
+def download_dataset(name, max_files):
+    cfg = DATASETS[name]
+    url, exts = cfg["url"], cfg["ext"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        archive = os.path.join(tmpdir, "dataset.tar.gz")
+
+        bar = st.progress(0.0, text="Downloading…")
+        r = requests.get(url, stream=True, timeout=300)
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
+        with open(archive, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    bar.progress(downloaded / total * 0.5,
+                                 text=f"Downloading… {downloaded // 1_000_000} / {total // 1_000_000} MB")
+
+        bar.progress(0.5, text="Extracting…")
+        extract_dir = os.path.join(tmpdir, "extracted")
+        os.makedirs(extract_dir)
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(extract_dir)
+
+        found = []
+        for root, _, files in os.walk(extract_dir):
+            for fname in files:
+                if fname.lower().endswith(exts):
+                    found.append(os.path.join(root, fname))
+
+        if max_files < len(found):
+            found = random.sample(found, max_files)
+
+        existing = len([f for f in os.listdir(DATA_DIR)
+                        if f.lower().endswith((".wav", ".flac"))])
+        for i, src in enumerate(found):
+            ext = os.path.splitext(src)[1]
+            dst = os.path.join(DATA_DIR, f"ds_{existing + i:06d}{ext}")
+            shutil.copy2(src, dst)
+            bar.progress(0.5 + (i + 1) / len(found) * 0.5,
+                         text=f"Copying {i + 1}/{len(found)} files…")
+
+        bar.progress(1.0, text="Done.")
+        return len(found)
+
+
+def interpolate_sounds(model, source_a, source_b, n_steps):
+    wav_a = load_waveform(source_a)
+    wav_b = load_waveform(source_b)
+
+    min_len = min(wav_a.shape[1], wav_b.shape[1])
+    wav_a = wav_a[:, :min_len]
+    wav_b = wav_b[:, :min_len]
+
+    pad = (CLIP_LENGTH - min_len % CLIP_LENGTH) % CLIP_LENGTH
+    if pad:
+        wav_a = F.pad(wav_a, (0, pad))
+        wav_b = F.pad(wav_b, (0, pad))
+
+    model.eval()
+    with torch.no_grad():
+        z_a, z_b = [], []
+        for start in range(0, wav_a.shape[1], CLIP_LENGTH):
+            z_a.append(model.encode(wav_a[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)))
+            z_b.append(model.encode(wav_b[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)))
+
+        results = []
+        for i in range(n_steps):
+            alpha = i / (n_steps - 1) if n_steps > 1 else 0.0
+            chunks = []
+            for za, zb in zip(z_a, z_b):
+                z = (1 - alpha) * za + alpha * zb
+                chunks.append(model.decode(z).squeeze(0).cpu())
+            audio = torch.cat(chunks, dim=1)[:, :min_len]
+            results.append((alpha, audio))
+
+    return results
+
+
 # ── ui ────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Generative Sound", layout="wide")
@@ -238,6 +343,22 @@ with tab1:
     c3.metric("Total audio", f"{len(clips):.0f}s")
 
     st.divider()
+    st.markdown("**Download a public dataset**")
+    st.write("Downloads audio files and copies them into your training set.")
+
+    ds_col1, ds_col2 = st.columns([3, 1])
+    ds_choice = ds_col1.selectbox("Dataset", list(DATASETS.keys()), label_visibility="collapsed")
+    max_files = ds_col2.number_input("Max files", min_value=10, max_value=10000,
+                                     value=500, step=100)
+    if st.button("Download & add to dataset"):
+        try:
+            n = download_dataset(ds_choice, int(max_files))
+            st.success(f"Added {n} files to data/raw/")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Download failed: {e}")
+
+    st.divider()
     st.markdown("**Danger zone**")
     if st.button("Clear dataset", type="secondary"):
         if "confirm_clear" not in st.session_state:
@@ -274,15 +395,37 @@ with tab2:
                                    help="N × 50 = total latent units. Smaller = more compression.")
     num_steps = col3.slider("Training steps", 100, 10000, 1000, 100)
 
-    col4, _ = st.columns([1, 2])
+    col4, col5, _ = st.columns([1, 1, 1])
     batch_size = col4.slider("Batch size", 4, 64, 16, 4)
+    model_type_label = col5.radio("Model type", ["Autoencoder", "VAE"], horizontal=True)
+    is_vae = model_type_label == "VAE"
+
+    beta = 0.1
+    free_bits = 0.5
+    if is_vae:
+        vae_col1, vae_col2 = st.columns(2)
+        beta = vae_col1.select_slider(
+            "KL weight (β)",
+            options=[0.0001, 0.001, 0.01, 0.1, 0.5, 1.0],
+            value=0.001,
+            help="Scales the KL term. Keep small (0.001) for audio — higher values cause collapse.",
+        )
+        free_bits = vae_col2.select_slider(
+            "Free bits (λ)",
+            options=[0.0, 0.1, 0.5, 1.0, 2.0, 4.0],
+            value=0.5,
+            help="Minimum KL each latent channel must carry. Prevents posterior collapse.",
+        )
 
     latent_units = latent_ch * 50
     compression = round(CLIP_LENGTH / latent_units, 1)
+    model_type_str = "vae" if is_vae else "ae"
     st.info(
+        f"{'VAE' if is_vae else 'Autoencoder'}  |  "
         f"Clip: **{CLIP_LENGTH} samples (50ms)**  |  "
         f"Latent: **{latent_ch} ch × 50 steps = {latent_units} units**  |  "
         f"**{compression}× compression**"
+        + (f"  |  β = {beta}  |  λ = {free_bits}" if is_vae else "")
     )
 
     if st.button("Train", type="primary"):
@@ -302,16 +445,23 @@ with tab2:
                                       drop_last=len(train_data) >= bs)
             val_loader = DataLoader(val_data, batch_size=bs)
 
-            model = Autoencoder(latent_ch=latent_ch).to(device)
+            model = (VAE if is_vae else Autoencoder)(latent_ch=latent_ch).to(device)
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
             progress = st.progress(0.0, text="Starting...")
-            chart = st.line_chart({"train loss": [], "val loss": []}, height=250)
+            chart_keys = {"recon loss": [], "val recon loss": []}
+            if is_vae:
+                chart_keys["kl loss"] = []
+            chart = st.line_chart(chart_keys, height=250)
             log_area = st.empty()
-            log_lines = [f"Found {len(clips)} clips | latent {latent_ch} ch | device {device}"]
+            log_lines = [
+                f"{'VAE' if is_vae else 'AE'} | "
+                f"{len(clips)} clips | latent {latent_ch} ch | device {device}"
+            ]
 
             report_every = max(1, num_steps // 20)
             step = 0
+            recon_loss_val = kl_loss_val = 0.0
 
             while step < num_steps:
                 model.train()
@@ -319,7 +469,18 @@ with tab2:
                     if step >= num_steps:
                         break
                     batch = batch.to(device)
-                    loss = F.l1_loss(model(batch), batch)
+
+                    if is_vae:
+                        recon, mu, logvar = model(batch)
+                        recon_loss_val = F.l1_loss(recon, batch)
+                        # free bits per channel: average KL over batch+time, floor per channel
+                        kl_per_ch = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean(dim=(0, 2))
+                        kl_loss_val = kl_per_ch.clamp(min=free_bits).mean()
+                        loss = recon_loss_val + beta * kl_loss_val
+                    else:
+                        loss = F.l1_loss(model(batch), batch)
+                        recon_loss_val = loss
+
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
@@ -328,17 +489,31 @@ with tab2:
                     if step % report_every == 0 or step == num_steps:
                         model.eval()
                         with torch.no_grad():
-                            v = [F.l1_loss(model(b.to(device)), b.to(device)).item()
-                                 for b in val_loader]
-                        val_loss = sum(v) / len(v)
+                            v_recon = []
+                            for b in val_loader:
+                                b = b.to(device)
+                                if is_vae:
+                                    out, _, _ = model(b)
+                                else:
+                                    out = model(b)
+                                v_recon.append(F.l1_loss(out, b).item())
+                        val_recon = sum(v_recon) / len(v_recon)
                         model.train()
-                        chart.add_rows({"train loss": [loss.item()], "val loss": [val_loss]})
-                        log_lines.append(
+
+                        row = {"recon loss": [recon_loss_val.item()],
+                               "val recon loss": [val_recon]}
+                        if is_vae:
+                            row["kl loss"] = [kl_loss_val.item()]
+                        chart.add_rows(row)
+
+                        log_line = (
                             f"step {step:5d}/{num_steps} | "
-                            f"train {loss.item():.4f} | val {val_loss:.4f}"
+                            f"recon {recon_loss_val.item():.4f} | val {val_recon:.4f}"
                         )
-                        progress.progress(step / num_steps,
-                                          text=f"Step {step}/{num_steps}")
+                        if is_vae:
+                            log_line += f" | kl {kl_loss_val.item():.4f}"
+                        log_lines.append(log_line)
+                        progress.progress(step / num_steps, text=f"Step {step}/{num_steps}")
                         log_area.code("\n".join(log_lines))
 
             pt_file = f"{name_clean}.pt"
@@ -346,11 +521,14 @@ with tab2:
             cfg = {
                 "name": name_clean,
                 "filename": pt_file,
+                "model_type": model_type_str,
                 "latent_ch": latent_ch,
                 "latent_units": latent_units,
                 "clip_length": CLIP_LENGTH,
                 "steps": num_steps,
                 "clips_used": len(clips),
+                "beta": beta if is_vae else None,
+                "free_bits": free_bits if is_vae else None,
             }
             with open(os.path.join(CHECKPOINT_DIR, f"{name_clean}.json"), "w") as f:
                 json.dump(cfg, f, indent=2)
@@ -369,10 +547,12 @@ with tab2:
         rows = [
             {
                 "Name": m["name"],
+                "Type": m.get("model_type", "ae").upper(),
+                "β": m.get("beta") or "—",
                 "Latent ch": m["latent_ch"],
                 "Latent units": m["latent_units"],
                 "Steps": m["steps"],
-                "Trained on (clips)": m["clips_used"],
+                "Clips": m["clips_used"],
             }
             for m in saved
         ]
@@ -380,43 +560,6 @@ with tab2:
 
 
 # ── tab 3: compare & reconstruct ─────────────────────────────────────────────
-
-def interpolate_sounds(model, source_a, source_b, n_steps):
-    wav_a = load_waveform(source_a)
-    wav_b = load_waveform(source_b)
-
-    # truncate the longest to match the shorter
-    min_len = min(wav_a.shape[1], wav_b.shape[1])
-    wav_a = wav_a[:, :min_len]
-    wav_b = wav_b[:, :min_len]
-
-    # pad both to a multiple of CLIP_LENGTH
-    pad = (CLIP_LENGTH - min_len % CLIP_LENGTH) % CLIP_LENGTH
-    if pad:
-        wav_a = F.pad(wav_a, (0, pad))
-        wav_b = F.pad(wav_b, (0, pad))
-
-    model.eval()
-    with torch.no_grad():
-        # encode every clip for A and B
-        z_a, z_b = [], []
-        for start in range(0, wav_a.shape[1], CLIP_LENGTH):
-            z_a.append(model.encode(wav_a[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)))
-            z_b.append(model.encode(wav_b[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)))
-
-        # for each alpha, interpolate latents and decode
-        results = []
-        for i in range(n_steps):
-            alpha = i / (n_steps - 1) if n_steps > 1 else 0.0
-            chunks = []
-            for za, zb in zip(z_a, z_b):
-                z = (1 - alpha) * za + alpha * zb
-                chunks.append(model.decode(z).squeeze(0).cpu())
-            audio = torch.cat(chunks, dim=1)[:, :min_len]
-            results.append((alpha, audio))
-
-    return results
-
 
 def rms(waveform):
     return float(waveform.pow(2).mean().sqrt())
