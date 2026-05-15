@@ -246,7 +246,24 @@ def download_dataset(name, max_files):
         return len(found)
 
 
-def interpolate_sounds(model, source_a, source_b, n_steps):
+def _slerp(za, zb, alpha):
+    # flatten to vectors, slerp, reshape back
+    shape = za.shape
+    a = za.reshape(1, -1).float()
+    b = zb.reshape(1, -1).float()
+    a_norm = F.normalize(a, dim=-1)
+    b_norm = F.normalize(b, dim=-1)
+    dot = (a_norm * b_norm).sum(dim=-1).clamp(-1, 1)
+    omega = dot.acos()
+    sin_omega = omega.sin()
+    # fall back to linear when vectors are nearly parallel
+    if sin_omega.abs() < 1e-6:
+        return ((1 - alpha) * za + alpha * zb)
+    return ((torch.sin((1 - alpha) * omega) / sin_omega) * a +
+            (torch.sin(alpha * omega) / sin_omega) * b).reshape(shape)
+
+
+def interpolate_sounds(model, source_a, source_b, n_steps, use_slerp=False):
     wav_a = load_waveform(source_a)
     wav_b = load_waveform(source_b)
 
@@ -271,7 +288,7 @@ def interpolate_sounds(model, source_a, source_b, n_steps):
             alpha = i / (n_steps - 1) if n_steps > 1 else 0.0
             chunks = []
             for za, zb in zip(z_a, z_b):
-                z = (1 - alpha) * za + alpha * zb
+                z = _slerp(za, zb, alpha) if use_slerp else (1 - alpha) * za + alpha * zb
                 chunks.append(model.decode(z).squeeze(0).cpu())
             audio = torch.cat(chunks, dim=1)[:, :min_len]
             results.append((alpha, audio))
@@ -462,6 +479,7 @@ with tab2:
             report_every = max(1, num_steps // 20)
             step = 0
             recon_loss_val = kl_loss_val = 0.0
+            loss_history = []
 
             while step < num_steps:
                 model.train()
@@ -515,6 +533,11 @@ with tab2:
                         log_lines.append(log_line)
                         progress.progress(step / num_steps, text=f"Step {step}/{num_steps}")
                         log_area.code("\n".join(log_lines))
+                        entry = {"step": step, "recon": round(recon_loss_val.item(), 5),
+                                 "val_recon": round(val_recon, 5)}
+                        if is_vae:
+                            entry["kl"] = round(kl_loss_val.item(), 5)
+                        loss_history.append(entry)
 
             pt_file = f"{name_clean}.pt"
             torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, pt_file))
@@ -529,6 +552,7 @@ with tab2:
                 "clips_used": len(clips),
                 "beta": beta if is_vae else None,
                 "free_bits": free_bits if is_vae else None,
+                "loss_history": loss_history,
             }
             with open(os.path.join(CHECKPOINT_DIR, f"{name_clean}.json"), "w") as f:
                 json.dump(cfg, f, indent=2)
@@ -676,6 +700,8 @@ with tab4:
             interp_model_name = st.selectbox("Model", [m["name"] for m in saved], key="interp_model")
             n_steps = st.slider("Number of steps", min_value=3, max_value=10, value=5,
                                 help="Includes α=0 (sound A) and α=1 (sound B)")
+            use_slerp = st.toggle("Spherical interpolation (slerp)",
+                                  help="Follows the curvature of the latent space instead of a straight line. Often sounds smoother.")
 
         st.divider()
         col_a, col_b = st.columns(2)
@@ -702,7 +728,7 @@ with tab4:
             try:
                 cfg = next(m for m in saved if m["name"] == interp_model_name)
                 m = load_model(cfg)
-                results = interpolate_sounds(m, source_a, source_b, n_steps)
+                results = interpolate_sounds(m, source_a, source_b, n_steps, use_slerp=use_slerp)
 
                 st.divider()
                 st.markdown("**Results** — play each step to hear the path through latent space")
