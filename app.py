@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import heapq
 import glob
 import shutil
 import random
@@ -16,6 +17,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import pandas as pd
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
 
@@ -338,6 +340,52 @@ def _slerp(za, zb, alpha):
             (torch.sin(alpha * omega) / sin_omega) * b).reshape(shape)
 
 
+_PGHI_GAMMA = 0.25645 * N_FFT ** 2   # time-frequency ratio of a Hann window
+
+
+def pghi(mag, tol=1e-6):
+    """Phase Gradient Heap Integration (Prusa et al. 2017).
+
+    Estimates a consistent STFT phase from magnitude alone, via the
+    phase-magnitude relations of a Gaussian-like window. Non-iterative.
+    mag: (bins, frames) numpy magnitude spectrogram -> phase in radians.
+    """
+    bins, frames = mag.shape
+    logs = np.log(np.maximum(mag, 1e-300))
+    logs = np.maximum(logs, logs.max() - 11.0)          # limit dynamic range
+
+    dm = np.zeros_like(logs)                            # d log|S| / d bin
+    dn = np.zeros_like(logs)                            # d log|S| / d frame
+    dm[1:-1, :] = (logs[2:, :] - logs[:-2, :]) / 2
+    dn[:, 1:-1] = (logs[:, 2:] - logs[:, :-2]) / 2
+
+    m_idx = np.arange(bins)[:, None]
+    # phase advance per hop / per bin; the -pi accounts for torch.stft
+    # placing the window origin at the frame start rather than its center
+    tgrad = (HOP_LENGTH * N_FFT / _PGHI_GAMMA) * dm + 2 * np.pi * HOP_LENGTH * m_idx / N_FFT
+    fgrad = -(_PGHI_GAMMA / (HOP_LENGTH * N_FFT)) * dn - np.pi
+
+    phase = np.zeros_like(mag)
+    done = mag <= tol * mag.max()
+    phase[done] = np.random.default_rng(0).uniform(0, 2 * np.pi, done.sum())
+
+    heap = []
+    start = np.unravel_index(np.argmax(mag), mag.shape)
+    heapq.heappush(heap, (-mag[start], start))
+    assigned = done.copy()
+    assigned[start] = True
+    while heap:
+        _, (m, n) = heapq.heappop(heap)
+        for dmm, dnn, grad, sign in ((0, 1, tgrad, 1), (0, -1, tgrad, -1),
+                                     (1, 0, fgrad, 1), (-1, 0, fgrad, -1)):
+            mm, nn = m + dmm, n + dnn
+            if 0 <= mm < bins and 0 <= nn < frames and not assigned[mm, nn]:
+                phase[mm, nn] = phase[m, n] + sign * (grad[m, n] + grad[mm, nn]) / 2
+                assigned[mm, nn] = True
+                heapq.heappush(heap, (-mag[mm, nn], (mm, nn)))
+    return phase
+
+
 def interpolate_sounds(model, source_a, source_b, n_steps, use_slerp=False):
     mel_a = waveform_to_mel(load_waveform(source_a))
     mel_b = waveform_to_mel(load_waveform(source_b))
@@ -351,11 +399,6 @@ def interpolate_sounds(model, source_a, source_b, n_steps, use_slerp=False):
         mel_a = F.pad(mel_a, (0, pad))
         mel_b = F.pad(mel_b, (0, pad))
 
-    # Phase advance per hop for each frequency bin: Δφ_k = 2π·k·H/N
-    bins        = N_FFT // 2 + 1
-    k           = torch.arange(bins, dtype=torch.float32)
-    phase_step  = torch.exp(1j * 2 * torch.pi * k * HOP_LENGTH / N_FFT).to(torch.complex64)
-
     model.eval()
     with torch.no_grad():
         z_a, z_b = [], []
@@ -367,29 +410,18 @@ def interpolate_sounds(model, source_a, source_b, n_steps, use_slerp=False):
         for i in range(n_steps):
             alpha = i / (n_steps - 1) if n_steps > 1 else 0.0
 
-            # Random initial phase per bin (avoids phase-aligned harmonics, which
-            # produce an audible pulse train every N_FFT samples); propagates
-            # continuously across all chunks.
-            current_phase = torch.exp(1j * 2 * torch.pi * torch.rand(bins)).to(torch.complex64)
-            all_frames = []
-
+            # Decode all chunks to magnitudes, then estimate a consistent
+            # phase for the whole spectrogram with PGHI.
+            all_mags = []
             for za, zb in zip(z_a, z_b):
                 z       = _slerp(za, zb, alpha) if use_slerp else (1 - alpha) * za + alpha * zb
                 mel_out = model.decode(z).squeeze(0).cpu()           # (1, N_MELS, CLIP_FRAMES)
                 stft_mag = _inverse_mel(mel_out[0].exp()).clamp(min=0).sqrt()  # (bins, CLIP_FRAMES)
+                all_mags.append(stft_mag)
 
-                # Build CLIP_FRAMES phase frames advancing from current_phase
-                phase_frames = []
-                ph = current_phase
-                for _ in range(CLIP_FRAMES):
-                    phase_frames.append(ph)
-                    ph = ph * phase_step
-                current_phase = ph                                    # carry to next chunk
-
-                phase_mat = torch.stack(phase_frames, dim=1)         # (bins, CLIP_FRAMES)
-                all_frames.append(stft_mag * phase_mat)
-
-            full_stft = torch.cat(all_frames, dim=1)[:, :min_frames]
+            full_mag = torch.cat(all_mags, dim=1)[:, :min_frames]
+            phase    = pghi(full_mag.numpy().astype(np.float64))
+            full_stft = (full_mag * torch.tensor(np.exp(1j * phase), dtype=torch.complex64))
             wav = torch.istft(full_stft, n_fft=N_FFT, hop_length=HOP_LENGTH,
                               window=_window, length=min_frames * HOP_LENGTH).unsqueeze(0)
             results.append((alpha, wav))
@@ -541,6 +573,15 @@ def _model_details(cfg):
     return d
 
 
+def _loss_history_chart(cfg):
+    """Render the persisted loss history of a saved model, if any."""
+    hist = cfg.get("loss_history") or []
+    if not hist:
+        st.caption("No loss history recorded for this model.")
+        return
+    st.line_chart(pd.DataFrame(hist).set_index("step"), height=180)
+
+
 def _run_training_loop(model, is_vae, train_loader, val_loader,
                        num_steps, start_step, beta, free_bits):
     """Shared training loop used by both Train and Continue. Returns loss_history."""
@@ -630,6 +671,12 @@ with tab2:
     if st.session_state.last_trained:
         last = st.session_state.last_trained
         st.success(f"Trained: **{last}**  — rename it if you like, then dismiss.")
+        _last_cfg_path = os.path.join(CHECKPOINT_DIR, f"{last}.json")
+        if os.path.exists(_last_cfg_path):
+            with open(_last_cfg_path) as f:
+                _last_cfg = json.load(f)
+            st.caption("Training loss")
+            _loss_history_chart(_last_cfg)
         ren_col1, ren_col2, ren_col3 = st.columns([3, 1, 1])
         new_name = ren_col1.text_input("New name", value=last, key="rename_input",
                                        label_visibility="collapsed")
@@ -650,6 +697,8 @@ with tab2:
                     with open(new_json, "w") as f:
                         json.dump(saved_cfg, f, indent=2)
                     os.remove(old_json)
+                if st.session_state.get("interp_model") == last:
+                    st.session_state["interp_model"] = new_name
             st.session_state.last_trained = None
             st.rerun()
         if ren_col3.button("Dismiss"):
@@ -736,6 +785,7 @@ with tab2:
             with open(os.path.join(CHECKPOINT_DIR, f"{auto_name}.json"), "w") as f:
                 json.dump(cfg, f, indent=2)
             st.session_state.last_trained = auto_name
+            st.session_state["interp_model"] = auto_name
             st.rerun()
 
     st.divider()
@@ -780,6 +830,7 @@ with tab2:
                 with open(os.path.join(CHECKPOINT_DIR, f"{cont_name}.json"), "w") as f:
                     json.dump(cont_cfg, f, indent=2)
                 st.success(f"'{cont_name}' trained for {cont_steps} more steps.")
+                st.session_state["interp_model"] = cont_name
                 st.rerun()
 
     st.divider()
@@ -804,6 +855,10 @@ with tab2:
             for m in saved
         ]
         st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        with st.expander("Loss history"):
+            view_name = st.selectbox("Model", [m["name"] for m in saved], key="loss_view")
+            _loss_history_chart(next(m for m in saved if m["name"] == view_name))
 
 
 # ── tab 3: compare & reconstruct ─────────────────────────────────────────────
