@@ -13,22 +13,53 @@ from torch.utils.data import DataLoader
 import torchaudio.transforms as T
 import soundfile as sf
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
 
-from model import Autoencoder, VAE
-from dataset import SAMPLE_RATE, CLIP_LENGTH
+from model import (Autoencoder, VAE, MLPAutoencoder, MLPVAE,
+                   WaveformAutoencoder, WaveformVAE, LATENT_H, LATENT_W)
+from dataset import SAMPLE_RATE, N_MELS, N_FFT, HOP_LENGTH, CLIP_FRAMES, CLIP_SAMPLES, waveform_to_mel
 
 DATA_DIR = "data/raw"
 CHECKPOINT_DIR = "checkpoints"
+DEBUG_DIR = "debug"
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(DEBUG_DIR, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+_inverse_mel = T.InverseMelScale(n_stft=N_FFT // 2 + 1, n_mels=N_MELS, sample_rate=SAMPLE_RATE)
+_window = torch.hann_window(N_FFT)
+
+
+def mel_to_waveform(mel, phase=None):
+    """(1, N_MELS, frames) log-mel → (1, samples).
+
+    If phase (complex STFT, shape (n_fft//2+1, frames)) is provided, it is used
+    directly — no phase estimation needed.  Otherwise falls back to zero-phase
+    ISTFT (sounds buzzy but has no iteration cost and no Griffin-Lim smearing).
+    """
+    # InverseMelScale inverts a power-scale mel → power STFT; take sqrt for magnitude.
+    # Clamp first because the pseudo-inverse can produce small negatives.
+    stft_mag = _inverse_mel(mel.exp()).clamp(min=0).sqrt()   # (1, n_fft//2+1, frames)
+    n_frames = stft_mag.shape[-1]
+    if phase is not None:
+        unit_phase = phase / (phase.abs() + 1e-8)
+        stft_c = stft_mag[0] * unit_phase
+    else:
+        stft_c = stft_mag[0].to(torch.complex64)   # zero imaginary → zero phase
+    wav = torch.istft(stft_c, n_fft=N_FFT, hop_length=HOP_LENGTH,
+                      window=_window, length=n_frames * HOP_LENGTH)
+    return wav.unsqueeze(0)                     # (1, samples)
+
 
 def load_waveform(source):
     if isinstance(source, bytes):
@@ -49,8 +80,10 @@ def load_clips():
             continue
         try:
             waveform = load_waveform(os.path.join(DATA_DIR, fname))
-            for start in range(0, waveform.shape[1] - CLIP_LENGTH + 1, CLIP_LENGTH):
-                clips.append(waveform[:, start:start + CLIP_LENGTH])
+            mel = waveform_to_mel(waveform)             # (1, N_MELS, frames)
+            total = mel.shape[2]
+            for start in range(0, total - CLIP_FRAMES + 1, CLIP_FRAMES):
+                clips.append(mel[:, :, start:start + CLIP_FRAMES])
         except Exception as e:
             st.warning(f"Skipping {fname}: {e}")
     return clips
@@ -84,7 +117,15 @@ def list_saved_models():
 
 def load_model(cfg):
     model_type = cfg.get("model_type", "ae")
-    cls = VAE if model_type == "vae" else Autoencoder
+    arch       = cfg.get("arch", "conv")
+    is_mel     = cfg.get("domain", "waveform") == "mel"
+    is_vae     = model_type == "vae"
+    if arch == "mlp":
+        cls = MLPVAE if is_vae else MLPAutoencoder
+    elif is_mel:
+        cls = VAE if is_vae else Autoencoder
+    else:
+        cls = WaveformVAE if is_vae else WaveformAutoencoder
     m = cls(latent_ch=cfg["latent_ch"]).to(device)
     pt_path = os.path.join(CHECKPOINT_DIR, cfg["filename"])
     m.load_state_dict(torch.load(pt_path, map_location=device, weights_only=True))
@@ -92,18 +133,52 @@ def load_model(cfg):
     return m
 
 
+_XFADE = 80  # crossfade length in samples (~5 ms at 16 kHz)
+
+def _stitch(chunks):
+    """Concatenate decoded waveform chunks with a short linear crossfade at each boundary."""
+    if len(chunks) == 1:
+        return chunks[0]
+    fade_out = torch.linspace(1.0, 0.0, _XFADE)
+    fade_in  = torch.linspace(0.0, 1.0, _XFADE)
+    result = chunks[0].clone()
+    for chunk in chunks[1:]:
+        result[:, -_XFADE:] = result[:, -_XFADE:] * fade_out + chunk[:, :_XFADE] * fade_in
+        result = torch.cat([result, chunk[:, _XFADE:]], dim=1)
+    return result
+
+
 def reconstruct(model, source):
-    waveform = load_waveform(source)
-    total = waveform.shape[1]
-    pad = (CLIP_LENGTH - total % CLIP_LENGTH) % CLIP_LENGTH
+    waveform  = load_waveform(source)
+    stft_orig = torch.stft(waveform[0], n_fft=N_FFT, hop_length=HOP_LENGTH,
+                           window=_window, return_complex=True)   # (bins, total_frames)
+    mel          = waveform_to_mel(waveform)                       # (1, N_MELS, total_frames)
+    total_frames = mel.shape[2]
+    pad = (CLIP_FRAMES - total_frames % CLIP_FRAMES) % CLIP_FRAMES
     if pad:
-        waveform = F.pad(waveform, (0, pad))
-    chunks = []
+        mel       = F.pad(mel, (0, pad))
+        stft_orig = F.pad(stft_orig, (0, pad))
+
+    # Decode every chunk, keeping the original STFT phases throughout.
+    # Collect all frames then do one single ISTFT — no chunk boundaries.
+    all_frames = []
     with torch.no_grad():
-        for start in range(0, waveform.shape[1], CLIP_LENGTH):
-            chunk = waveform[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)
-            chunks.append(model.decode(model.encode(chunk)).squeeze(0).cpu())
-    return torch.cat(chunks, dim=1)[:, :total]
+        for start in range(0, mel.shape[2], CLIP_FRAMES):
+            mel_chunk = mel[:, :, start:start + CLIP_FRAMES].unsqueeze(0).to(device)
+            mel_out   = model.decode(model.encode(mel_chunk)).squeeze(0).cpu()
+            stft_mag  = _inverse_mel(mel_out[0].exp()).clamp(min=0).sqrt()
+            orig_ph   = stft_orig[:, start:start + CLIP_FRAMES]
+            unit_ph   = orig_ph / (orig_ph.abs() + 1e-8)
+            all_frames.append(stft_mag * unit_ph)
+
+    full_stft = torch.cat(all_frames, dim=1)[:, :total_frames]
+    wav = torch.istft(full_stft, n_fft=N_FFT, hop_length=HOP_LENGTH,
+                      window=_window, length=total_frames * HOP_LENGTH).unsqueeze(0)
+    in_rms  = waveform.pow(2).mean().sqrt()
+    out_rms = wav.pow(2).mean().sqrt()
+    if out_rms > 1e-6:
+        wav = wav * (in_rms / out_rms)
+    return wav
 
 
 # ── architecture explanation ──────────────────────────────────────────────────
@@ -264,34 +339,60 @@ def _slerp(za, zb, alpha):
 
 
 def interpolate_sounds(model, source_a, source_b, n_steps, use_slerp=False):
-    wav_a = load_waveform(source_a)
-    wav_b = load_waveform(source_b)
+    mel_a = waveform_to_mel(load_waveform(source_a))
+    mel_b = waveform_to_mel(load_waveform(source_b))
 
-    min_len = min(wav_a.shape[1], wav_b.shape[1])
-    wav_a = wav_a[:, :min_len]
-    wav_b = wav_b[:, :min_len]
+    min_frames = min(mel_a.shape[2], mel_b.shape[2])
+    mel_a = mel_a[:, :, :min_frames]
+    mel_b = mel_b[:, :, :min_frames]
 
-    pad = (CLIP_LENGTH - min_len % CLIP_LENGTH) % CLIP_LENGTH
+    pad = (CLIP_FRAMES - min_frames % CLIP_FRAMES) % CLIP_FRAMES
     if pad:
-        wav_a = F.pad(wav_a, (0, pad))
-        wav_b = F.pad(wav_b, (0, pad))
+        mel_a = F.pad(mel_a, (0, pad))
+        mel_b = F.pad(mel_b, (0, pad))
+
+    # Phase advance per hop for each frequency bin: Δφ_k = 2π·k·H/N
+    bins        = N_FFT // 2 + 1
+    k           = torch.arange(bins, dtype=torch.float32)
+    phase_step  = torch.exp(1j * 2 * torch.pi * k * HOP_LENGTH / N_FFT).to(torch.complex64)
 
     model.eval()
     with torch.no_grad():
         z_a, z_b = [], []
-        for start in range(0, wav_a.shape[1], CLIP_LENGTH):
-            z_a.append(model.encode(wav_a[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)))
-            z_b.append(model.encode(wav_b[:, start:start + CLIP_LENGTH].unsqueeze(0).to(device)))
+        for start in range(0, mel_a.shape[2], CLIP_FRAMES):
+            z_a.append(model.encode(mel_a[:, :, start:start + CLIP_FRAMES].unsqueeze(0).to(device)))
+            z_b.append(model.encode(mel_b[:, :, start:start + CLIP_FRAMES].unsqueeze(0).to(device)))
 
         results = []
         for i in range(n_steps):
             alpha = i / (n_steps - 1) if n_steps > 1 else 0.0
-            chunks = []
+
+            # Random initial phase per bin (avoids phase-aligned harmonics, which
+            # produce an audible pulse train every N_FFT samples); propagates
+            # continuously across all chunks.
+            current_phase = torch.exp(1j * 2 * torch.pi * torch.rand(bins)).to(torch.complex64)
+            all_frames = []
+
             for za, zb in zip(z_a, z_b):
-                z = _slerp(za, zb, alpha) if use_slerp else (1 - alpha) * za + alpha * zb
-                chunks.append(model.decode(z).squeeze(0).cpu())
-            audio = torch.cat(chunks, dim=1)[:, :min_len]
-            results.append((alpha, audio))
+                z       = _slerp(za, zb, alpha) if use_slerp else (1 - alpha) * za + alpha * zb
+                mel_out = model.decode(z).squeeze(0).cpu()           # (1, N_MELS, CLIP_FRAMES)
+                stft_mag = _inverse_mel(mel_out[0].exp()).clamp(min=0).sqrt()  # (bins, CLIP_FRAMES)
+
+                # Build CLIP_FRAMES phase frames advancing from current_phase
+                phase_frames = []
+                ph = current_phase
+                for _ in range(CLIP_FRAMES):
+                    phase_frames.append(ph)
+                    ph = ph * phase_step
+                current_phase = ph                                    # carry to next chunk
+
+                phase_mat = torch.stack(phase_frames, dim=1)         # (bins, CLIP_FRAMES)
+                all_frames.append(stft_mag * phase_mat)
+
+            full_stft = torch.cat(all_frames, dim=1)[:, :min_frames]
+            wav = torch.istft(full_stft, n_fft=N_FFT, hop_length=HOP_LENGTH,
+                              window=_window, length=min_frames * HOP_LENGTH).unsqueeze(0)
+            results.append((alpha, wav))
 
     return results
 
@@ -304,6 +405,17 @@ st.caption(f"Device: {device}  |  Sample rate: {SAMPLE_RATE} Hz  |  Clip length:
 
 with st.expander("How does this network work? (architecture + loss function)"):
     st.markdown(ARCH_EXPLANATION)
+
+for _key in ("recon_a", "recon_b", "last_trained", "interp_src_a", "interp_src_b"):
+    if _key not in st.session_state:
+        st.session_state[_key] = None
+
+for _key, _fname in (("interp_src_a", "interp_a.wav"), ("interp_src_b", "interp_b.wav")):
+    if st.session_state[_key] is None:
+        _path = os.path.join(DEBUG_DIR, _fname)
+        if os.path.exists(_path):
+            with open(_path, "rb") as _f:
+                st.session_state[_key] = _f.read()
 
 tab1, tab2, tab3, tab4 = st.tabs(["1 · Data", "2 · Train", "3 · Compare & Reconstruct", "4 · Interpolate"])
 
@@ -325,9 +437,9 @@ with tab1:
             if st.button("Add uploaded file"):
                 waveform = load_waveform(uploaded.read())
                 path = save_recording(waveform)
-                n = waveform.shape[1] // CLIP_LENGTH
+                n = waveform.shape[1] // CLIP_SAMPLES
                 if n == 0:
-                    st.warning("Recording is shorter than 1 second — no clips were added.")
+                    st.warning("Recording is shorter than 50 ms — no clips were added.")
                 else:
                     st.success(f"Saved {waveform.shape[1] / SAMPLE_RATE:.1f}s → {n} clip(s)")
 
@@ -338,11 +450,11 @@ with tab1:
             st.audio(audio_bytes, format="audio/wav")
             if st.button("Add recording"):
                 waveform = load_waveform(audio_bytes)
-                n = waveform.shape[1] // CLIP_LENGTH
+                n = waveform.shape[1] // CLIP_SAMPLES
                 if n == 0:
                     st.warning(
                         f"Recording is {waveform.shape[1] / SAMPLE_RATE:.2f}s — "
-                        "needs to be at least 1 second to produce a clip."
+                        "needs to be at least 50 ms to produce a clip."
                     )
                 else:
                     save_recording(waveform)
@@ -356,8 +468,9 @@ with tab1:
 
     c1, c2, c3 = st.columns([1, 1, 1])
     c1.metric("Files in dataset", len(files))
-    c2.metric("1-second clips", len(clips))
-    c3.metric("Total audio", f"{len(clips):.0f}s")
+    c2.metric("50ms clips", len(clips))
+    clip_secs = CLIP_SAMPLES / SAMPLE_RATE
+    c3.metric("Total audio", f"{len(clips) * clip_secs:.0f}s")
 
     st.divider()
     st.markdown("**Download a public dataset**")
@@ -397,56 +510,199 @@ with tab1:
             st.rerun()
 
 
+# ── tab 2 helpers ─────────────────────────────────────────────────────────────
+
+def _next_model_name():
+    existing = glob.glob(os.path.join(CHECKPOINT_DIR, "*.json"))
+    return f"run_{len(existing) + 1:03d}"
+
+
+def _model_details(cfg):
+    is_vae = cfg.get("model_type", "ae") == "vae"
+    arch   = cfg.get("arch", "conv")
+    latent = (f"{cfg['latent_ch']} dims" if arch == "mlp"
+              else f"{cfg['latent_ch']} ch × {LATENT_H}×{LATENT_W} = {cfg['latent_units']} units")
+    d = {
+        "Type":       ("VAE" if is_vae else "Autoencoder") + f" ({arch.upper()})",
+        "Domain":     cfg.get("domain", "mel"),
+        "Input":      f"{cfg.get('clip_frames', CLIP_FRAMES)} mel frame × {cfg.get('n_mels', N_MELS)} bins  ({cfg.get('clip_ms', round(CLIP_FRAMES * HOP_LENGTH / SAMPLE_RATE * 1000))} ms)",
+        "Latent":     latent,
+        "Steps":      cfg["steps"],
+        "Clips used": cfg["clips_used"],
+    }
+    if is_vae and cfg.get("beta") is not None:
+        d["β (KL weight)"] = cfg["beta"]
+        d["Free bits"]     = cfg.get("free_bits", "—")
+    d["Reconstruction"] = ("Original STFT phase + single full ISTFT — no chunk boundaries"
+                           if cfg.get("domain", "mel") == "mel"
+                           else "Direct waveform decode")
+    d["Generation / interp"] = ("Phase propagation: Δφ_k = 2π·k·H/N per hop, "
+                                "continuous across chunks, single ISTFT")
+    return d
+
+
+def _run_training_loop(model, is_vae, train_loader, val_loader,
+                       num_steps, start_step, beta, free_bits):
+    """Shared training loop used by both Train and Continue. Returns loss_history."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    st.caption("Reconstruction loss (train + val)")
+    recon_chart = st.line_chart({"recon": [], "val recon": []}, height=180)
+    if is_vae:
+        st.caption("KL loss")
+        kl_chart = st.line_chart({"kl": []}, height=150)
+
+    progress  = st.progress(0.0, text="Starting…")
+    log_area  = st.empty()
+    log_lines = []
+    loss_history = []
+
+    report_every = max(1, num_steps // 20)
+    step = start_step
+    total = start_step + num_steps
+    recon_loss_val = kl_loss_val = 0.0
+
+    while step < total:
+        model.train()
+        for batch in train_loader:
+            if step >= total:
+                break
+            batch = batch.to(device)
+
+            if is_vae:
+                recon, mu, logvar = model(batch)
+                recon_loss_val = F.l1_loss(recon, batch)
+                kl_raw    = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+                reduce_dims = tuple(i for i in range(kl_raw.dim()) if i != 1)
+                kl_per_ch = kl_raw.mean(dim=reduce_dims)
+                kl_loss_val = kl_per_ch.clamp(min=free_bits).mean()
+                loss = recon_loss_val + beta * kl_loss_val
+            else:
+                loss = F.l1_loss(model(batch), batch)
+                recon_loss_val = loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            step += 1
+
+            if step % report_every == 0 or step == total:
+                model.eval()
+                with torch.no_grad():
+                    v_recon = []
+                    for b in val_loader:
+                        b = b.to(device)
+                        out = model(b)[0] if is_vae else model(b)
+                        v_recon.append(F.l1_loss(out, b).item())
+                val_recon = sum(v_recon) / len(v_recon)
+                model.train()
+
+                recon_chart.add_rows({"recon": [recon_loss_val.item()], "val recon": [val_recon]})
+                if is_vae:
+                    kl_chart.add_rows({"kl": [kl_loss_val.item()]})
+
+                log_line = (f"step {step:5d}/{total} | "
+                            f"recon {recon_loss_val.item():.4f} | val {val_recon:.4f}")
+                if is_vae:
+                    log_line += f" | kl {kl_loss_val.item():.4f}"
+                log_lines.append(log_line)
+                progress.progress((step - start_step) / num_steps,
+                                  text=f"Step {step}/{total}")
+                log_area.code("\n".join(log_lines[-12:]))
+
+                entry = {"step": step,
+                         "recon": round(recon_loss_val.item(), 5),
+                         "val_recon": round(val_recon, 5)}
+                if is_vae:
+                    entry["kl"] = round(kl_loss_val.item(), 5)
+                loss_history.append(entry)
+
+    progress.progress(1.0, text="Done!")
+    return loss_history
+
+
 # ── tab 2: train ──────────────────────────────────────────────────────────────
 
 with tab2:
     st.subheader("Train a model")
-    st.write("Give it a name so you can compare different configs later.")
+
+    # ── rename last trained model ──────────────────────────────────────────────
+    if st.session_state.last_trained:
+        last = st.session_state.last_trained
+        st.success(f"Trained: **{last}**  — rename it if you like, then dismiss.")
+        ren_col1, ren_col2, ren_col3 = st.columns([3, 1, 1])
+        new_name = ren_col1.text_input("New name", value=last, key="rename_input",
+                                       label_visibility="collapsed")
+        if ren_col2.button("Save name"):
+            new_name = new_name.strip().replace(" ", "_")
+            if new_name and new_name != last:
+                old_pt   = os.path.join(CHECKPOINT_DIR, f"{last}.pt")
+                old_json = os.path.join(CHECKPOINT_DIR, f"{last}.json")
+                new_pt   = os.path.join(CHECKPOINT_DIR, f"{new_name}.pt")
+                new_json = os.path.join(CHECKPOINT_DIR, f"{new_name}.json")
+                if os.path.exists(old_pt):
+                    os.rename(old_pt, new_pt)
+                if os.path.exists(old_json):
+                    with open(old_json) as f:
+                        saved_cfg = json.load(f)
+                    saved_cfg["name"]     = new_name
+                    saved_cfg["filename"] = f"{new_name}.pt"
+                    with open(new_json, "w") as f:
+                        json.dump(saved_cfg, f, indent=2)
+                    os.remove(old_json)
+            st.session_state.last_trained = None
+            st.rerun()
+        if ren_col3.button("Dismiss"):
+            st.session_state.last_trained = None
+            st.rerun()
+        st.divider()
+
+    # ── new training run ───────────────────────────────────────────────────────
+    auto_name = _next_model_name()
+    st.caption(f"Will be saved as **{auto_name}** — rename after training.")
 
     col1, col2, col3 = st.columns(3)
-    model_name = col1.text_input("Model name", value="model_01",
-                                 help="Used as the filename. No spaces.")
-    latent_ch = col2.select_slider("Latent channels (N)",
-                                   options=[2, 4, 8, 16, 32],
-                                   value=2,
-                                   help="N × 50 = total latent units. Smaller = more compression.")
-    num_steps = col3.slider("Training steps", 100, 10000, 1000, 100)
+    latent_ch     = col1.select_slider("Latent channels",
+                                       options=[2, 4, 8, 16, 32], value=16)
+    num_steps     = col2.slider("Training steps", 100, 20000, 10000, 100)
+    batch_size    = col3.slider("Batch size", 4, 64, 16, 4)
 
-    col4, col5, _ = st.columns([1, 1, 1])
-    batch_size = col4.slider("Batch size", 4, 64, 16, 4)
-    model_type_label = col5.radio("Model type", ["Autoencoder", "VAE"], horizontal=True)
+    col3b, col4, col5 = st.columns([1, 1, 2])
+    arch_label       = col3b.radio("Architecture", ["MLP", "Conv"], horizontal=True)
+    model_type_label = col4.radio("Model type", ["Autoencoder", "VAE"], horizontal=True)
+    is_mlp = arch_label == "MLP"
     is_vae = model_type_label == "VAE"
 
-    beta = 0.1
+    beta = 0.001
     free_bits = 0.5
     if is_vae:
-        vae_col1, vae_col2 = st.columns(2)
-        beta = vae_col1.select_slider(
-            "KL weight (β)",
-            options=[0.0001, 0.001, 0.01, 0.1, 0.5, 1.0],
-            value=0.001,
-            help="Scales the KL term. Keep small (0.001) for audio — higher values cause collapse.",
-        )
-        free_bits = vae_col2.select_slider(
-            "Free bits (λ)",
-            options=[0.0, 0.1, 0.5, 1.0, 2.0, 4.0],
-            value=0.5,
-            help="Minimum KL each latent channel must carry. Prevents posterior collapse.",
-        )
+        v1, v2 = col5.columns(2)
+        beta      = v1.select_slider("β",
+                                     options=[0.0001, 0.001, 0.01, 0.1, 0.5, 1.0],
+                                     value=0.001)
+        free_bits = v2.select_slider("Free bits",
+                                     options=[0.0, 0.1, 0.5, 1.0, 2.0, 4.0],
+                                     value=0.5)
 
-    latent_units = latent_ch * 50
-    compression = round(CLIP_LENGTH / latent_units, 1)
+    if is_mlp:
+        latent_units = latent_ch
+    else:
+        latent_units = latent_ch * LATENT_H * LATENT_W
+    mel_units      = N_MELS * CLIP_FRAMES
+    compression    = round(mel_units / latent_units, 1)
+    clip_ms        = round(CLIP_FRAMES * HOP_LENGTH / SAMPLE_RATE * 1000)
     model_type_str = "vae" if is_vae else "ae"
+    arch_str       = "mlp" if is_mlp else "conv"
+    latent_desc    = (f"{latent_ch} dims" if is_mlp
+                      else f"{latent_ch} ch × {LATENT_H}×{LATENT_W} = {latent_units} units")
     st.info(
-        f"{'VAE' if is_vae else 'Autoencoder'}  |  "
-        f"Clip: **{CLIP_LENGTH} samples (50ms)**  |  "
-        f"Latent: **{latent_ch} ch × 50 steps = {latent_units} units**  |  "
-        f"**{compression}× compression**"
-        + (f"  |  β = {beta}  |  λ = {free_bits}" if is_vae else "")
+        f"{'VAE' if is_vae else 'Autoencoder'} ({arch_label})  |  Mel spectrogram  |  "
+        f"Input: {CLIP_FRAMES} frame × {N_MELS} bins ({clip_ms} ms)  |  "
+        f"Latent: {latent_desc}  |  {compression}× compression"
+        + (f"  |  β={beta}  λ={free_bits}" if is_vae else "")
     )
 
     if st.button("Train", type="primary"):
-        name_clean = model_name.strip().replace(" ", "_") or "model"
         clips = load_clips()
         if not clips:
             st.error("No clips found. Add recordings in the Data tab first.")
@@ -454,115 +710,81 @@ with tab2:
             data = torch.stack(clips)
             val_size = max(1, len(clips) // 10)
             perm = torch.randperm(len(clips))
-            train_data = data[perm[val_size:]]
-            val_data = data[perm[:val_size]]
+            train_loader = DataLoader(data[perm[val_size:]], batch_size=int(batch_size),
+                                      shuffle=True, drop_last=len(clips) - val_size >= int(batch_size))
+            val_loader   = DataLoader(data[perm[:val_size]], batch_size=int(batch_size))
 
-            bs = int(batch_size)
-            train_loader = DataLoader(train_data, batch_size=bs, shuffle=True,
-                                      drop_last=len(train_data) >= bs)
-            val_loader = DataLoader(val_data, batch_size=bs)
+            if is_mlp:
+                model = (MLPVAE if is_vae else MLPAutoencoder)(latent_ch=latent_ch).to(device)
+            else:
+                model = (VAE if is_vae else Autoencoder)(latent_ch=latent_ch).to(device)
+            loss_history = _run_training_loop(model, is_vae, train_loader, val_loader,
+                                              num_steps, 0, beta, free_bits)
 
-            model = (VAE if is_vae else Autoencoder)(latent_ch=latent_ch).to(device)
-            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-            progress = st.progress(0.0, text="Starting...")
-            chart_keys = {"recon loss": [], "val recon loss": []}
-            if is_vae:
-                chart_keys["kl loss"] = []
-            chart = st.line_chart(chart_keys, height=250)
-            log_area = st.empty()
-            log_lines = [
-                f"{'VAE' if is_vae else 'AE'} | "
-                f"{len(clips)} clips | latent {latent_ch} ch | device {device}"
-            ]
-
-            report_every = max(1, num_steps // 20)
-            step = 0
-            recon_loss_val = kl_loss_val = 0.0
-            loss_history = []
-
-            while step < num_steps:
-                model.train()
-                for batch in train_loader:
-                    if step >= num_steps:
-                        break
-                    batch = batch.to(device)
-
-                    if is_vae:
-                        recon, mu, logvar = model(batch)
-                        recon_loss_val = F.l1_loss(recon, batch)
-                        # free bits per channel: average KL over batch+time, floor per channel
-                        kl_per_ch = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean(dim=(0, 2))
-                        kl_loss_val = kl_per_ch.clamp(min=free_bits).mean()
-                        loss = recon_loss_val + beta * kl_loss_val
-                    else:
-                        loss = F.l1_loss(model(batch), batch)
-                        recon_loss_val = loss
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    step += 1
-
-                    if step % report_every == 0 or step == num_steps:
-                        model.eval()
-                        with torch.no_grad():
-                            v_recon = []
-                            for b in val_loader:
-                                b = b.to(device)
-                                if is_vae:
-                                    out, _, _ = model(b)
-                                else:
-                                    out = model(b)
-                                v_recon.append(F.l1_loss(out, b).item())
-                        val_recon = sum(v_recon) / len(v_recon)
-                        model.train()
-
-                        row = {"recon loss": [recon_loss_val.item()],
-                               "val recon loss": [val_recon]}
-                        if is_vae:
-                            row["kl loss"] = [kl_loss_val.item()]
-                        chart.add_rows(row)
-
-                        log_line = (
-                            f"step {step:5d}/{num_steps} | "
-                            f"recon {recon_loss_val.item():.4f} | val {val_recon:.4f}"
-                        )
-                        if is_vae:
-                            log_line += f" | kl {kl_loss_val.item():.4f}"
-                        log_lines.append(log_line)
-                        progress.progress(step / num_steps, text=f"Step {step}/{num_steps}")
-                        log_area.code("\n".join(log_lines))
-                        entry = {"step": step, "recon": round(recon_loss_val.item(), 5),
-                                 "val_recon": round(val_recon, 5)}
-                        if is_vae:
-                            entry["kl"] = round(kl_loss_val.item(), 5)
-                        loss_history.append(entry)
-
-            pt_file = f"{name_clean}.pt"
+            pt_file = f"{auto_name}.pt"
             torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, pt_file))
             cfg = {
-                "name": name_clean,
-                "filename": pt_file,
-                "model_type": model_type_str,
-                "latent_ch": latent_ch,
-                "latent_units": latent_units,
-                "clip_length": CLIP_LENGTH,
-                "steps": num_steps,
-                "clips_used": len(clips),
+                "name": auto_name, "filename": pt_file,
+                "domain": "mel", "model_type": model_type_str, "arch": arch_str,
+                "latent_ch": latent_ch, "latent_units": latent_units,
+                "clip_frames": CLIP_FRAMES, "n_mels": N_MELS, "clip_ms": clip_ms,
+                "steps": num_steps, "clips_used": len(clips),
                 "beta": beta if is_vae else None,
                 "free_bits": free_bits if is_vae else None,
                 "loss_history": loss_history,
             }
-            with open(os.path.join(CHECKPOINT_DIR, f"{name_clean}.json"), "w") as f:
+            with open(os.path.join(CHECKPOINT_DIR, f"{auto_name}.json"), "w") as f:
                 json.dump(cfg, f, indent=2)
-
-            progress.progress(1.0, text="Done!")
-            log_lines.append(f"\nSaved as '{name_clean}'")
-            log_area.code("\n".join(log_lines))
-            st.success(f"Model '{name_clean}' saved. Go to Compare & Reconstruct.")
+            st.session_state.last_trained = auto_name
+            st.rerun()
 
     st.divider()
+
+    # ── continue training ──────────────────────────────────────────────────────
+    st.markdown("**Continue training a saved model**")
+    saved_for_cont = list_saved_models()
+    if not saved_for_cont:
+        st.caption("No saved models yet.")
+    else:
+        cc1, cc2, cc3 = st.columns([2, 1, 1])
+        cont_name = cc1.selectbox("Model", [m["name"] for m in saved_for_cont],
+                                  key="cont_model")
+        cont_steps = cc2.slider("Additional steps", 100, 20000, 2000, 100,
+                                key="cont_steps")
+        cont_cfg = next(m for m in saved_for_cont if m["name"] == cont_name)
+        if cc3.button("Continue", type="secondary"):
+            clips = load_clips()
+            if not clips:
+                st.error("No clips found.")
+            else:
+                data = torch.stack(clips)
+                val_size = max(1, len(clips) // 10)
+                perm = torch.randperm(len(clips))
+                train_loader = DataLoader(data[perm[val_size:]], batch_size=16,
+                                          shuffle=True, drop_last=len(clips) - val_size >= 16)
+                val_loader   = DataLoader(data[perm[:val_size]], batch_size=16)
+
+                cont_m = load_model(cont_cfg)
+                cont_m.train()
+                cont_is_vae   = cont_cfg.get("model_type", "ae") == "vae"
+                cont_beta      = cont_cfg.get("beta") or 0.001
+                cont_free_bits = cont_cfg.get("free_bits") or 0.5
+                start_step     = cont_cfg.get("steps", 0)
+
+                new_hist = _run_training_loop(cont_m, cont_is_vae, train_loader, val_loader,
+                                              cont_steps, start_step, cont_beta, cont_free_bits)
+                torch.save(cont_m.state_dict(),
+                           os.path.join(CHECKPOINT_DIR, cont_cfg["filename"]))
+                cont_cfg["steps"] = start_step + cont_steps
+                cont_cfg["loss_history"] = cont_cfg.get("loss_history", []) + new_hist
+                with open(os.path.join(CHECKPOINT_DIR, f"{cont_name}.json"), "w") as f:
+                    json.dump(cont_cfg, f, indent=2)
+                st.success(f"'{cont_name}' trained for {cont_steps} more steps.")
+                st.rerun()
+
+    st.divider()
+
+    # ── saved models table ─────────────────────────────────────────────────────
     st.markdown("**Saved models**")
     saved = list_saved_models()
     if not saved:
@@ -570,13 +792,14 @@ with tab2:
     else:
         rows = [
             {
-                "Name": m["name"],
-                "Type": m.get("model_type", "ae").upper(),
-                "β": m.get("beta") or "—",
-                "Latent ch": m["latent_ch"],
-                "Latent units": m["latent_units"],
-                "Steps": m["steps"],
-                "Clips": m["clips_used"],
+                "Name":         m["name"],
+                "Type":         m.get("model_type", "ae").upper(),
+                "Domain":       m.get("domain", "mel"),
+                "Input":        f"{m.get('clip_frames', '?')}fr × {m.get('n_mels', N_MELS)}mel ({m.get('clip_ms', '?')}ms)",
+                "Latent":       f"{m['latent_ch']}ch = {m['latent_units']}u",
+                "β":            m.get("beta") or "—",
+                "Steps":        m["steps"],
+                "Clips":        m["clips_used"],
             }
             for m in saved
         ]
@@ -589,10 +812,23 @@ def rms(waveform):
     return float(waveform.pow(2).mean().sqrt())
 
 
-# Persist reconstructions across reruns
-for key in ("recon_a", "recon_b"):
-    if key not in st.session_state:
-        st.session_state[key] = None
+def _waveform_fig(waveform, label="", save_as=None):
+    wav = waveform.squeeze().numpy()
+    t   = np.arange(len(wav)) / SAMPLE_RATE
+    fig, ax = plt.subplots(figsize=(6, 1.5))
+    ax.plot(t, wav, linewidth=0.3, color="steelblue")
+    ax.set_xlim(t[0], t[-1])
+    ax.set_xlabel("s", fontsize=7)
+    ax.set_ylim(-1, 1)
+    ax.tick_params(labelsize=7)
+    if label:
+        ax.set_title(label, fontsize=8)
+    fig.tight_layout(pad=0.3)
+    if save_as:
+        fig.savefig(os.path.join(DEBUG_DIR, save_as), dpi=150)
+    return fig
+
+
 
 with tab3:
     st.subheader("Compare models")
@@ -623,6 +859,9 @@ with tab3:
             source_waveform = load_waveform(source)
             src_rms = rms(source_waveform)
             st.audio(source, format="audio/wav")
+            fig = _waveform_fig(source_waveform, "Input", save_as="waveform_input.png")
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
             st.caption(f"Input amplitude (RMS): **{src_rms:.4f}**")
 
         st.divider()
@@ -633,10 +872,8 @@ with tab3:
             st.markdown("**Model A — reconstruction**")
             sel_a = st.selectbox("Select model A", model_names, key="sel_a")
             cfg_a = next(m for m in saved if m["name"] == sel_a)
-            st.caption(
-                f"Latent: {cfg_a['latent_ch']} ch × 50 = {cfg_a['latent_units']} units  |  "
-                f"Steps: {cfg_a['steps']}"
-            )
+            with st.expander("Model details"):
+                st.json(_model_details(cfg_a))
             if source and st.button("Reconstruct with A", type="primary"):
                 try:
                     m = load_model(cfg_a)
@@ -648,6 +885,10 @@ with tab3:
             if st.session_state.recon_a:
                 audio_bytes, out_rms = st.session_state.recon_a
                 st.audio(audio_bytes, format="audio/wav")
+                recon_wav_a = load_waveform(audio_bytes)
+                fig = _waveform_fig(recon_wav_a, "Reconstruction A", save_as="waveform_recon_a.png")
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
                 src_rms_val = rms(source_waveform) if source_waveform is not None else 0
                 st.caption(f"Output amplitude (RMS): **{out_rms:.4f}**  "
                            f"(input was {src_rms_val:.4f})")
@@ -659,10 +900,8 @@ with tab3:
             default_b = min(1, len(model_names) - 1)
             sel_b = st.selectbox("Select model B", model_names, index=default_b, key="sel_b")
             cfg_b = next(m for m in saved if m["name"] == sel_b)
-            st.caption(
-                f"Latent: {cfg_b['latent_ch']} ch × 50 = {cfg_b['latent_units']} units  |  "
-                f"Steps: {cfg_b['steps']}"
-            )
+            with st.expander("Model details"):
+                st.json(_model_details(cfg_b))
             if source and st.button("Reconstruct with B", type="primary"):
                 try:
                     m = load_model(cfg_b)
@@ -674,6 +913,10 @@ with tab3:
             if st.session_state.recon_b:
                 audio_bytes, out_rms = st.session_state.recon_b
                 st.audio(audio_bytes, format="audio/wav")
+                recon_wav_b = load_waveform(audio_bytes)
+                fig = _waveform_fig(recon_wav_b, "Reconstruction B", save_as="waveform_recon_b.png")
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
                 src_rms_val = rms(source_waveform) if source_waveform is not None else 0
                 st.caption(f"Output amplitude (RMS): **{out_rms:.4f}**  "
                            f"(input was {src_rms_val:.4f})")
@@ -686,9 +929,9 @@ with tab3:
 with tab4:
     st.subheader("Interpolate between two sounds")
     st.write(
-        "Each sound is encoded clip by clip (50ms chunks). "
-        "Latents are interpolated at each α step and decoded back to audio. "
-        "The longer sound is truncated to match the shorter."
+        "Each sound is encoded clip by clip (50 ms chunks). "
+        "Latents are interpolated at each α step and decoded directly to waveform. "
+        "Chunks are stitched for continuity. The longer sound is truncated to match the shorter."
     )
 
     saved = list_saved_models()
@@ -708,19 +951,37 @@ with tab4:
 
         with col_a:
             st.markdown("**Sound A** (α = 0.0)")
-            up_a = st.file_uploader("Upload A", type=["wav", "flac"], key="interp_a",
-                                    label_visibility="collapsed")
+            up_a  = st.file_uploader("Upload A", type=["wav", "flac"], key="interp_a",
+                                     label_visibility="collapsed")
             rec_a = audio_recorder(text="Or record A", pause_threshold=3.0, key="interp_rec_a")
-            source_a = up_a.read() if up_a else (rec_a if rec_a else None)
+            if up_a:
+                new_a = up_a.read()
+                with open(os.path.join(DEBUG_DIR, "interp_a.wav"), "wb") as f:
+                    f.write(new_a)
+                st.session_state.interp_src_a = new_a
+            elif rec_a:
+                with open(os.path.join(DEBUG_DIR, "interp_a.wav"), "wb") as f:
+                    f.write(rec_a)
+                st.session_state.interp_src_a = rec_a
+            source_a = st.session_state.interp_src_a
             if source_a:
                 st.audio(source_a, format="audio/wav")
 
         with col_b:
             st.markdown("**Sound B** (α = 1.0)")
-            up_b = st.file_uploader("Upload B", type=["wav", "flac"], key="interp_b",
-                                    label_visibility="collapsed")
+            up_b  = st.file_uploader("Upload B", type=["wav", "flac"], key="interp_b",
+                                     label_visibility="collapsed")
             rec_b = audio_recorder(text="Or record B", pause_threshold=3.0, key="interp_rec_b")
-            source_b = up_b.read() if up_b else (rec_b if rec_b else None)
+            if up_b:
+                new_b = up_b.read()
+                with open(os.path.join(DEBUG_DIR, "interp_b.wav"), "wb") as f:
+                    f.write(new_b)
+                st.session_state.interp_src_b = new_b
+            elif rec_b:
+                with open(os.path.join(DEBUG_DIR, "interp_b.wav"), "wb") as f:
+                    f.write(rec_b)
+                st.session_state.interp_src_b = rec_b
+            source_b = st.session_state.interp_src_b
             if source_b:
                 st.audio(source_b, format="audio/wav")
 

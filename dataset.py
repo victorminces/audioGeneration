@@ -6,7 +6,23 @@ import soundfile as sf
 
 
 SAMPLE_RATE = 16000
-CLIP_LENGTH = 800    # 50 ms
+N_MELS     = 80
+N_FFT      = 1024
+HOP_LENGTH = 256
+CLIP_FRAMES  = 1        #  1 STFT frame per clip (256 / 16000 ≈ 16 ms)
+CLIP_SAMPLES = 800      # 800 / 16000 = 50 ms of raw waveform
+
+_mel_transform = T.MelSpectrogram(
+    sample_rate=SAMPLE_RATE,
+    n_fft=N_FFT,
+    hop_length=HOP_LENGTH,
+    n_mels=N_MELS,
+)
+
+
+def waveform_to_mel(waveform):
+    """(1, samples) → (1, N_MELS, frames) log-mel spectrogram."""
+    return (_mel_transform(waveform) + 1e-6).log()
 
 
 class AudioDataset(Dataset):
@@ -19,15 +35,15 @@ class AudioDataset(Dataset):
 
     def _load_file(self, path):
         data, sr = sf.read(path, dtype="float32", always_2d=True)
-        waveform = torch.tensor(data.T)  # (channels, samples)
+        waveform = torch.tensor(data.T)
         if sr != SAMPLE_RATE:
             waveform = T.Resample(sr, SAMPLE_RATE)(waveform)
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
-        total = waveform.shape[1]
-        for start in range(0, total - CLIP_LENGTH + 1, CLIP_LENGTH):
-            clip = waveform[:, start:start + CLIP_LENGTH]
-            self.clips.append(clip)
+        mel = waveform_to_mel(waveform)           # (1, N_MELS, frames)
+        total = mel.shape[2]
+        for start in range(0, total - CLIP_FRAMES + 1, CLIP_FRAMES):
+            self.clips.append(mel[:, :, start:start + CLIP_FRAMES])
 
     def __len__(self):
         return len(self.clips)
