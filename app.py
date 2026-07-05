@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
+from streamlit_image_coordinates import streamlit_image_coordinates
+from PIL import Image, ImageDraw
 
 from model import (Autoencoder, VAE, MLPAutoencoder, MLPVAE,
                    WaveformAutoencoder, WaveformVAE, LATENT_H, LATENT_W)
@@ -386,6 +388,75 @@ def pghi(mag, tol=1e-6):
     return phase
 
 
+# ── sound square helpers ─────────────────────────────────────────────────────
+
+SQUARE_SECONDS = 2.0
+SQUARE_SAMPLES = int(SQUARE_SECONDS * SAMPLE_RATE)
+SQUARE_PX      = 380   # canvas size in pixels
+
+
+def fix_length(waveform, n_samples=SQUARE_SAMPLES):
+    """Trim or zero-pad (1, samples) to exactly n_samples."""
+    if waveform.shape[1] >= n_samples:
+        return waveform[:, :n_samples]
+    return F.pad(waveform, (0, n_samples - waveform.shape[1]))
+
+
+def encode_frames(model, waveform):
+    """(1, samples) → (T, ...) latent sequence, one latent per mel frame."""
+    mel = waveform_to_mel(waveform)                       # (1, N_MELS, T)
+    frames = mel[0].T.unsqueeze(1).unsqueeze(-1)          # (T, 1, N_MELS, 1)
+    with torch.no_grad():
+        return model.encode(frames.to(device))            # (T, ...)
+
+
+def decode_frames(model, z_seq):
+    """(T, ...) latent sequence → (1, samples) via PGHI synthesis."""
+    with torch.no_grad():
+        mel_out = model.decode(z_seq).cpu()               # (T, 1, N_MELS, 1)
+    mel_mat  = mel_out.squeeze(-1).squeeze(1).T           # (N_MELS, T)
+    full_mag = _inverse_mel(mel_mat.exp()).clamp(min=0).sqrt()   # (bins, T)
+    phase    = pghi(full_mag.numpy().astype(np.float64))
+    full_stft = full_mag * torch.tensor(np.exp(1j * phase), dtype=torch.complex64)
+    wav = torch.istft(full_stft, n_fft=N_FFT, hop_length=HOP_LENGTH,
+                      window=_window, length=full_mag.shape[1] * HOP_LENGTH)
+    return wav.unsqueeze(0)
+
+
+def idw_weights(points, qx, qy, power):
+    """Inverse-distance weights for query (qx, qy) against [(x, y), ...]."""
+    d = np.array([np.hypot(qx - x, qy - y) for x, y in points])
+    nearest = int(d.argmin())
+    if d[nearest] < 1e-3:                                 # clicked on a sound
+        w = np.zeros(len(d)); w[nearest] = 1.0
+        return w
+    w = 1.0 / d ** power
+    return w / w.sum()
+
+
+def draw_square(sounds, pending=None, cursor=None):
+    img = Image.new("RGB", (SQUARE_PX, SQUARE_PX), "#1a1a2e")
+    dr = ImageDraw.Draw(img)
+    for i in range(1, 4):                                 # grid lines
+        p = SQUARE_PX * i // 4
+        dr.line([(p, 0), (p, SQUARE_PX)], fill="#2a2a45")
+        dr.line([(0, p), (SQUARE_PX, p)], fill="#2a2a45")
+    dr.rectangle([0, 0, SQUARE_PX - 1, SQUARE_PX - 1], outline="#44446a")
+    r = 9
+    for i, s in enumerate(sounds):
+        x, y = s["x"] * SQUARE_PX, s["y"] * SQUARE_PX
+        dr.ellipse([x - r, y - r, x + r, y + r], fill="#4f9dde", outline="white")
+        dr.text((x + r + 3, y - r), str(i + 1), fill="white")
+    if pending is not None:
+        x, y = pending[0] * SQUARE_PX, pending[1] * SQUARE_PX
+        dr.ellipse([x - r, y - r, x + r, y + r], outline="#e05555", width=2)
+    if cursor is not None:
+        x, y = cursor[0] * SQUARE_PX, cursor[1] * SQUARE_PX
+        dr.line([(x - r, y), (x + r, y)], fill="#57d992", width=2)
+        dr.line([(x, y - r), (x, y + r)], fill="#57d992", width=2)
+    return img
+
+
 def interpolate_sounds(model, source_a, source_b, n_steps, use_slerp=False):
     mel_a = waveform_to_mel(load_waveform(source_a))
     mel_b = waveform_to_mel(load_waveform(source_b))
@@ -438,9 +509,12 @@ st.caption(f"Device: {device}  |  Sample rate: {SAMPLE_RATE} Hz  |  Clip length:
 with st.expander("How does this network work? (architecture + loss function)"):
     st.markdown(ARCH_EXPLANATION)
 
-for _key in ("recon_a", "recon_b", "last_trained", "interp_src_a", "interp_src_b"):
+for _key in ("recon_a", "recon_b", "last_trained", "interp_src_a", "interp_src_b",
+             "sq_pending", "sq_last_rec", "sq_last_click", "sq_result"):
     if _key not in st.session_state:
         st.session_state[_key] = None
+if "sq_sounds" not in st.session_state:
+    st.session_state.sq_sounds = []   # [{"x", "y", "wav" (1, samples) tensor}]
 
 for _key, _fname in (("interp_src_a", "interp_a.wav"), ("interp_src_b", "interp_b.wav")):
     if st.session_state[_key] is None:
@@ -449,7 +523,8 @@ for _key, _fname in (("interp_src_a", "interp_a.wav"), ("interp_src_b", "interp_
             with open(_path, "rb") as _f:
                 st.session_state[_key] = _f.read()
 
-tab1, tab2, tab3, tab4 = st.tabs(["1 · Data", "2 · Train", "3 · Compare & Reconstruct", "4 · Interpolate"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["1 · Data", "2 · Train", "3 · Compare & Reconstruct",
+                                        "4 · Interpolate", "5 · Sound Square"])
 
 
 # ── tab 1: data ───────────────────────────────────────────────────────────────
@@ -1056,3 +1131,98 @@ with tab4:
                         st.audio(tensor_to_bytes(audio), format="audio/wav")
             except Exception as e:
                 st.error(f"Error: {e}")
+
+
+# ── tab 5: sound square ───────────────────────────────────────────────────────
+
+with tab5:
+    st.subheader("Sound Square")
+    st.write(
+        "**Training:** click the square, then record — a 2-second sound gets pinned "
+        "to that spot. Add as many as you like. "
+        "**Inference:** click anywhere and the sounds are blended by their distance "
+        "to your click (inverse-distance weighting on the frame-level latents)."
+    )
+
+    sq_saved = list_saved_models()
+    if not sq_saved:
+        st.warning("No trained models yet. Train one in the Train tab.")
+    else:
+        c1, c2, c3 = st.columns([2, 2, 1])
+        sq_model_name = c1.selectbox("Model", [m["name"] for m in sq_saved], key="sq_model")
+        sq_mode = c2.radio("Mode", ["Add sounds", "Generate"], horizontal=True, key="sq_mode")
+        sq_power = c3.slider("Sharpness", 0.5, 8.0, 2.0, 0.5,
+                             help="IDW exponent: low = smooth global blend, high = nearest sound dominates")
+
+        sounds = st.session_state.sq_sounds
+        col_sq, col_side = st.columns([1, 1])
+
+        with col_sq:
+            img = draw_square(sounds,
+                              pending=st.session_state.sq_pending,
+                              cursor=st.session_state.sq_last_click if sq_mode == "Generate" else None)
+            click = streamlit_image_coordinates(img, key="sq_canvas")
+
+        if click is not None:
+            cx, cy = click["x"] / SQUARE_PX, click["y"] / SQUARE_PX
+            if (cx, cy) != (st.session_state.sq_last_click or (None, None)):
+                st.session_state.sq_last_click = (cx, cy)
+                if sq_mode == "Add sounds":
+                    st.session_state.sq_pending = (cx, cy)
+                    st.rerun()
+                else:
+                    if len(sounds) < 2:
+                        st.warning("Add at least 2 sounds first.")
+                    else:
+                        try:
+                            cfg = next(m for m in sq_saved if m["name"] == sq_model_name)
+                            m = load_model(cfg)
+                            latents = [encode_frames(m, s["wav"]) for s in sounds]
+                            n_frames = min(z.shape[0] for z in latents)
+                            w = idw_weights([(s["x"], s["y"]) for s in sounds], cx, cy, sq_power)
+                            z_mix = sum(float(wi) * z[:n_frames] for wi, z in zip(w, latents))
+                            wav = decode_frames(m, z_mix)
+                            st.session_state.sq_result = (tensor_to_bytes(wav), w)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+
+        with col_side:
+            if sq_mode == "Add sounds":
+                if st.session_state.sq_pending is not None:
+                    px, py = st.session_state.sq_pending
+                    st.markdown(f"**Record 2 s for point ({px:.2f}, {py:.2f})**")
+                    rec = audio_recorder(text="Record", pause_threshold=2.5, key="sq_rec")
+                    if rec and rec != st.session_state.sq_last_rec:
+                        st.session_state.sq_last_rec = rec
+                        wav = fix_length(load_waveform(rec))
+                        sounds.append({"x": px, "y": py, "wav": wav})
+                        st.session_state.sq_pending = None
+                        st.rerun()
+                else:
+                    st.caption("Click the square to choose where the next sound goes.")
+
+                if sounds:
+                    st.markdown(f"**{len(sounds)} sound(s) placed**")
+                    for i, s in enumerate(sounds):
+                        cc1, cc2 = st.columns([4, 1])
+                        with cc1:
+                            st.caption(f"{i + 1} — ({s['x']:.2f}, {s['y']:.2f})")
+                            st.audio(tensor_to_bytes(s["wav"]), format="audio/wav")
+                        if cc2.button("✕", key=f"sq_del_{i}"):
+                            sounds.pop(i)
+                            st.rerun()
+                    if st.button("Clear all", key="sq_clear"):
+                        st.session_state.sq_sounds = []
+                        st.session_state.sq_pending = None
+                        st.session_state.sq_result = None
+                        st.rerun()
+            else:
+                if st.session_state.sq_result:
+                    audio_bytes, w = st.session_state.sq_result
+                    st.markdown("**Generated sound**")
+                    st.audio(audio_bytes, format="audio/wav", autoplay=True)
+                    st.caption("Weights: " +
+                               ", ".join(f"{i + 1}: {wi:.2f}" for i, wi in enumerate(w)))
+                else:
+                    st.caption("Click the square to generate a sound.")
