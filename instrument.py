@@ -381,25 +381,34 @@ def main():
         if mode != "idle" and take is not None:
             x, y = to_unit(pos)
             take.tick(x, y)
-            if mode == "trace":
-                trace_path.append((x, y))
 
         # ── draw ──
+        def decimate(pts, cap=300):
+            """Cap polyline cost: at most `cap` points regardless of length."""
+            step = max(1, len(pts) // cap)
+            return pts[::step]
+
         screen.fill((16, 16, 30))
         if show_map and map_surface is not None:
             screen.blit(map_surface, (MARGIN, MARGIN))
         pygame.draw.rect(screen, (60, 60, 100),
                          (MARGIN, MARGIN, SIZE, SIZE), width=1)
         for path in demo_paths:                 # past demonstrations, dim
-            pts = [(MARGIN + p[0] * SIZE, MARGIN + p[1] * SIZE) for p in path]
+            pts = [(MARGIN + p[0] * SIZE, MARGIN + p[1] * SIZE)
+                   for p in decimate(path)]
             if len(pts) > 1:
                 pygame.draw.lines(screen, (70, 90, 70), False, pts, 1)
         if mode == "demo" and take and len(take.cursor) > 1:
-            pts = [(MARGIN + c[1] * SIZE, MARGIN + c[2] * SIZE) for c in take.cursor]
+            pts = [(MARGIN + c[1] * SIZE, MARGIN + c[2] * SIZE)
+                   for c in decimate(take.cursor)]
             pygame.draw.lines(screen, (220, 90, 90), False, pts, 2)
-        if len(trace_path) > 1:
+        if mode == "trace" and take and len(take.cursor) > 1:
+            pts = [(MARGIN + c[1] * SIZE, MARGIN + c[2] * SIZE)
+                   for c in decimate(take.cursor)]
+            pygame.draw.lines(screen, (90, 200, 130), False, pts, 2)
+        elif len(trace_path) > 1:
             pts = [(MARGIN + p[0] * SIZE, MARGIN + p[1] * SIZE)
-                   for p in np.atleast_2d(np.array(trace_path))]
+                   for p in decimate(np.atleast_2d(np.array(trace_path)))]
             pygame.draw.lines(screen, (90, 200, 130), False, pts, 2)
 
         if playback is not None:
