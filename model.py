@@ -280,3 +280,83 @@ class WaveformVAE(nn.Module):
 
     def decode(self, z):
         return self.decoder(z)
+
+
+# ── linear-STFT models (2D conv, 512 bins) ───────────────────────────────────
+# Operate on log-magnitude STFT frames (Nyquist bin dropped: 513 → 512 so the
+# frequency axis halves cleanly). No mel bottleneck, no InverseMelScale smear.
+
+STFT_BINS     = 512
+STFT_LATENT_H = 4    # 512 / 2^7
+
+
+def _stft_conv_stack():
+    return nn.Sequential(
+        nn.Conv2d(1,  16, kernel_size=3, stride=(2, 1), padding=1), nn.ELU(),
+        nn.Conv2d(16, 32, kernel_size=3, stride=(2, 1), padding=1), nn.ELU(),
+        nn.Conv2d(32, 64, kernel_size=3, stride=(2, 1), padding=1), nn.ELU(),
+        nn.Conv2d(64, 64, kernel_size=3, stride=(2, 1), padding=1), nn.ELU(),
+        nn.Conv2d(64, 64, kernel_size=3, stride=(2, 1), padding=1), nn.ELU(),
+        nn.Conv2d(64, 64, kernel_size=3, stride=(2, 1), padding=1), nn.ELU(),
+    )
+
+
+def _stft_deconv_stack(latent_ch):
+    return nn.Sequential(
+        nn.ConvTranspose2d(latent_ch, 64, kernel_size=3, stride=(2, 1), padding=1, output_padding=(1, 0)), nn.ELU(),
+        nn.ConvTranspose2d(64, 64,        kernel_size=3, stride=(2, 1), padding=1, output_padding=(1, 0)), nn.ELU(),
+        nn.ConvTranspose2d(64, 64,        kernel_size=3, stride=(2, 1), padding=1, output_padding=(1, 0)), nn.ELU(),
+        nn.ConvTranspose2d(64, 64,        kernel_size=3, stride=(2, 1), padding=1, output_padding=(1, 0)), nn.ELU(),
+        nn.ConvTranspose2d(64, 32,        kernel_size=3, stride=(2, 1), padding=1, output_padding=(1, 0)), nn.ELU(),
+        nn.ConvTranspose2d(32, 16,        kernel_size=3, stride=(2, 1), padding=1, output_padding=(1, 0)), nn.ELU(),
+        nn.ConvTranspose2d(16,  1,        kernel_size=3, stride=(2, 1), padding=1, output_padding=(1, 0)),
+    )
+
+
+class STFTAutoencoder(nn.Module):
+    def __init__(self, latent_ch=16):
+        super().__init__()
+        self.latent_ch = latent_ch
+        self.encoder = nn.Sequential(
+            *_stft_conv_stack(),
+            nn.Conv2d(64, latent_ch, kernel_size=3, stride=(2, 1), padding=1),
+        )
+        self.decoder = _stft_deconv_stack(latent_ch)
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+    def encode(self, x):
+        return self.encoder(x)
+
+    def decode(self, z):
+        return self.decoder(z)
+
+
+class STFTVAE(nn.Module):
+    def __init__(self, latent_ch=16):
+        super().__init__()
+        self.latent_ch = latent_ch
+        self.shared      = _stft_conv_stack()
+        self.mu_head     = nn.Conv2d(64, latent_ch, kernel_size=3, stride=(2, 1), padding=1)
+        self.logvar_head = nn.Conv2d(64, latent_ch, kernel_size=3, stride=(2, 1), padding=1)
+        self.decoder     = _stft_deconv_stack(latent_ch)
+
+    def reparameterize(self, mu, logvar):
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            return mu + torch.randn_like(std) * std
+        return mu
+
+    def forward(self, x):
+        h = self.shared(x)
+        mu, logvar = self.mu_head(h), self.logvar_head(h)
+        logvar = logvar.clamp(-4, 4)
+        z = self.reparameterize(mu, logvar)
+        return self.decoder(z), mu, logvar
+
+    def encode(self, x):
+        return self.mu_head(self.shared(x))
+
+    def decode(self, z):
+        return self.decoder(z)
