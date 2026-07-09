@@ -7,6 +7,7 @@ The decoder is trained end-to-end through the synthesizer with a multi-scale
 spectral loss (Engel et al., ICLR 2020). Output is waveform directly — no
 phase reconstruction needed.
 """
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -204,3 +205,73 @@ def synthesize_params(model, params):
                                          params["z"].unsqueeze(0))
         wav = model.synthesize(params["f0"].unsqueeze(0), amp, harm, noise)
     return wav
+
+
+# ── streaming synthesis ───────────────────────────────────────────────────────
+
+class StreamingSynth:
+    """Frame-by-frame synthesis with carried state: decoder GRU hidden state,
+    oscillator phase, parameter ramps, and noise overlap-add tail. Feed one
+    (f0, loud, z) per call; get HOP samples back. Causal, ~ms per frame."""
+
+    NOISE_FFT = 512   # per-block noise filtering (kernel <= 257 taps via OLA)
+
+    def __init__(self, model):
+        self.model = model
+        self.reset()
+
+    def reset(self):
+        self.h = None                          # decoder GRU hidden state
+        self.phase = 0.0                       # running oscillator phase (rad)
+        self.prev = None                       # previous frame (f0, amp, harm)
+        self.noise_tail = np.zeros(self.NOISE_FFT - HOP, dtype=np.float64)
+
+    def _decode_frame(self, f0, loud, z):
+        """One decoder step with carried GRU state -> (amp, harm, noise) frames."""
+        d = self.model.decoder
+        x = torch.empty(1, 1, 2 + Z_DIM, dtype=torch.float32)
+        x[0, 0, 0] = (np.log2(max(f0, 1.0)) - 5.9) / 3.3     # scale_f0, scalar
+        x[0, 0, 1] = (loud + 8.0) / 8.0                      # scale_loud, scalar
+        x[0, 0, 2:] = torch.from_numpy(np.asarray(z, dtype=np.float32))
+        with torch.inference_mode():
+            hh = d.mlp_in(x)
+            hh, h_new = d.gru(hh, self.h)
+            self.h = h_new.clone()
+            hh = d.mlp_out(torch.cat([hh, x], dim=-1))
+            amp   = _exp_sigmoid(d.head_amp(hh))[0, 0]
+            harm  = _exp_sigmoid(d.head_harm(hh))[0, 0]
+            harm  = harm / (harm.sum() + 1e-7)
+            noise = _exp_sigmoid(d.head_noise(hh))[0, 0]
+        return float(amp), harm.numpy().astype(np.float64), noise.numpy().astype(np.float64)
+
+    def render(self, f0, loud, z):
+        """One frame of parameters -> HOP samples (numpy float32)."""
+        amp, harm, noise = self._decode_frame(f0, loud, z)
+        if self.prev is None:
+            self.prev = (f0, amp, harm)
+        f0_a, amp_a, harm_a = self.prev
+
+        # linear ramps from previous frame's values across the block
+        r = (np.arange(HOP) + 1.0) / HOP
+        f0_up   = f0_a + (f0 - f0_a) * r
+        amp_up  = amp_a + (amp - amp_a) * r
+        harm_up = harm_a[None, :] + (harm - harm_a)[None, :] * r[:, None]
+
+        phase = self.phase + 2 * np.pi * np.cumsum(f0_up) / SR
+        self.phase = float(phase[-1] % (2 * np.pi))
+        k = np.arange(1, N_HARMONICS + 1)
+        alias = (f0_up[:, None] * k[None, :]) < (SR / 2)
+        audio_h = amp_up * (np.sin(phase[:, None] * k[None, :]) * harm_up * alias).sum(axis=1)
+
+        # filtered noise: block FFT multiply + overlap-add tail
+        wn = np.random.uniform(-1, 1, HOP)
+        spec = np.fft.rfft(wn, n=self.NOISE_FFT)
+        filt = np.interp(np.linspace(0, 1, self.NOISE_FFT // 2 + 1),
+                         np.linspace(0, 1, N_NOISE), noise)
+        block = np.fft.irfft(spec * filt, n=self.NOISE_FFT)
+        audio_n = block[:HOP] + np.concatenate(
+            [self.noise_tail, np.zeros(HOP - min(HOP, len(self.noise_tail)))])[:HOP]
+        self.noise_tail = block[HOP:]
+
+        self.prev = (f0, amp, harm)
+        return (audio_h + audio_n).astype(np.float32)

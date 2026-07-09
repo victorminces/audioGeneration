@@ -17,10 +17,15 @@ import glob
 import json
 import time
 
+import threading
+from collections import deque
+
 import numpy as np
 import torch
 import pygame
 import sounddevice as sd
+
+torch.set_num_threads(1)   # tiny per-frame ops: avoid thread-pool overhead
 
 PROJ = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJ)
@@ -176,6 +181,77 @@ def cursor_at(cur, times):
     return np.stack([x, y], axis=1)
 
 
+# ── live engine ─────────────────────────────────────────────────────────────────
+
+class LiveEngine:
+    """Continuous audio: a producer thread renders 16 ms frames slightly ahead
+    (reading the latest cursor + gate), the sound-card callback consumes them.
+    Gate on = sound follows the cursor live; gate off = fade to silence."""
+
+    AHEAD = 4          # frames of cushion (~64 ms) between producer and card
+
+    def __init__(self, mapper):
+        self.mapper = mapper
+        self.synth = ddsp.StreamingSynth(MODEL)
+        self.buf = deque()
+        self.lock = threading.Lock()
+        self.target = (0.5, 0.5, 0.0)          # x, y, gate
+        self.gain = 0.0
+        self.underruns = 0
+        self.running = True
+        self.thread = threading.Thread(target=self._produce, daemon=True)
+        self.stream = sd.OutputStream(samplerate=ddsp.SR, channels=1,
+                                      blocksize=ddsp.HOP, latency="low",
+                                      callback=self._cb)
+        self.thread.start()
+        self.stream.start()
+
+    def set(self, x, y, gate):
+        self.target = (x, y, 1.0 if gate else 0.0)
+
+    def set_mapper(self, mapper):
+        self.mapper = mapper
+
+    def _cb(self, outdata, frames, t, status):
+        with self.lock:
+            block = self.buf.popleft() if self.buf else None
+        if block is None:
+            outdata[:, 0] = 0.0
+            if self.gain > 1e-3:
+                self.underruns += 1
+        else:
+            outdata[:, 0] = block
+
+    def _produce(self):
+        while self.running:
+            with self.lock:
+                n = len(self.buf)
+            if n >= self.AHEAD:
+                time.sleep(0.002)
+                continue
+            x, y, gate = self.target
+            new_gain = self.gain + 0.35 * (gate - self.gain)   # ~50 ms ramp
+            if new_gain < 1e-3 and gate == 0.0:
+                new_gain = 0.0
+            if new_gain <= 0.0 or self.mapper.W is None:
+                frame = np.zeros(ddsp.HOP, dtype=np.float32)
+                self.synth.reset()                # fresh state on next note
+            else:
+                p = self.mapper.predict(np.array([[x, y]]))[0]
+                f0 = float(np.clip(np.exp(p[0]), 60, 600))
+                frame = self.synth.render(f0, float(p[1]), p[2:])
+                ramp = np.linspace(self.gain, new_gain, ddsp.HOP, dtype=np.float32)
+                frame = frame * ramp
+            self.gain = new_gain
+            with self.lock:
+                self.buf.append(frame)
+
+    def close(self):
+        self.running = False
+        self.thread.join(timeout=1)
+        self.stream.stop(); self.stream.close()
+
+
 # ── app ───────────────────────────────────────────────────────────────────────
 
 print("loading DDSP model…", flush=True)
@@ -221,7 +297,9 @@ def main():
     status = "hold LEFT + sing to demonstrate; hold RIGHT to play"
     demo_paths, trace_path = [], []
     map_surface, show_map = None, True
-    playback = None                             # {"cur": (t,x,y) array, "start": t0, "dur": s}
+    playback = None
+    last_live = None
+    engine = LiveEngine(mapper)                             # {"cur": (t,x,y) array, "start": t0, "dur": s}
 
     def to_unit(pos):
         return (np.clip((pos[0] - MARGIN) / SIZE, 0, 1),
@@ -239,6 +317,7 @@ def main():
                     running = False
                 elif ev.key == pygame.K_c:
                     mapper = RBFMapper(); demo_paths = []
+                    engine.set_mapper(mapper)
                     map_surface = None
                     status = "map cleared"
                 elif ev.key == pygame.K_m:
@@ -252,8 +331,20 @@ def main():
                 elif ev.key == pygame.K_s:
                     mapper.save(session_path, MODEL_NAME)
                     status = f"saved {os.path.basename(session_path)}"
+                elif ev.key == pygame.K_p and last_live is not None and mapper.W is not None:
+                    cur = last_live
+                    dur = cur[-1, 0]
+                    t = np.arange(int(dur * ddsp.SR / ddsp.HOP)) * ddsp.HOP / ddsp.SR
+                    if len(t) > 2:
+                        status = "synthesizing replay…"; pygame.display.flip()
+                        out = synthesize_targets(mapper.predict(cursor_at(cur, t)))
+                        sd.play(out, ddsp.SR)
+                        playback = {"cur": cur, "start": time.perf_counter(),
+                                    "dur": len(out) / ddsp.SR}
+                        status = f"replaying {dur:.1f}s"
                 elif ev.key == pygame.K_l and os.path.exists(session_path):
                     name = mapper.load(session_path)
+                    engine.set_mapper(mapper)
                     map_surface = render_map_surface(mapper)
                     status = f"loaded session ({mapper.seconds:.0f}s, model {name})"
             elif ev.type == pygame.MOUSEBUTTONDOWN and mode == "idle":
@@ -263,7 +354,7 @@ def main():
                 elif ev.button == 3:
                     mode, take = "trace", Take(record_audio=False)
                     trace_path = []
-                    status = "tracing…"
+                    status = "LIVE — sound follows the cursor"
             elif ev.type == pygame.MOUSEBUTTONUP and mode != "idle":
                 audio, cur = take.stop()
                 if mode == "demo" and len(cur) > 5 and len(audio) > ddsp.SR // 2:
@@ -277,23 +368,16 @@ def main():
                     status = (f"map updated: {mapper.seconds:.1f}s total "
                               f"({len(demo_paths)} takes)")
                 elif mode == "trace" and len(cur) > 5:
-                    if mapper.W is None:
-                        status = "no map yet — demonstrate first"
-                    else:
-                        dur = cur[-1, 0]
-                        t = np.arange(int(dur * ddsp.SR / ddsp.HOP)) * ddsp.HOP / ddsp.SR
-                        if len(t) > 2:
-                            status = "synthesizing…"; pygame.display.flip()
-                            xy = cursor_at(cur, t)
-                            out = synthesize_targets(mapper.predict(xy))
-                            sd.play(out, ddsp.SR)
-                            playback = {"cur": cur, "start": time.perf_counter(),
-                                        "dur": len(out) / ddsp.SR}
-                            status = f"playing {dur:.1f}s"
-                        trace_path = cur[:, 1:]
+                    trace_path = cur[:, 1:]
+                    last_live = cur
+                    status = ("no map yet — demonstrate first"
+                              if mapper.W is None else
+                              "released (P = clean offline replay of that path)")
                 mode, take = "idle", None
 
         pos = pygame.mouse.get_pos()
+        ux, uy = to_unit(pos)
+        engine.set(ux, uy, gate=(mode == "trace"))
         if mode != "idle" and take is not None:
             x, y = to_unit(pos)
             take.tick(x, y)
@@ -336,11 +420,13 @@ def main():
                     (MARGIN, SIZE + MARGIN + 12))
         screen.blit(font.render(
             f"map: {mapper.seconds:.1f}s | kernel {mapper.sigma:.2f} | "
-            f"S save L load C clear M map UP/DOWN detail Q quit",
+            f"underruns {engine.underruns} | "
+            f"S save L load C clear M map P replay UP/DOWN detail Q quit",
             True, (120, 120, 140)), (MARGIN, SIZE + MARGIN + 34))
         pygame.display.flip()
         clock.tick(CURSOR_HZ)
 
+    engine.close()
     pygame.quit()
 
 
