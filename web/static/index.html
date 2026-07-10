@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gesture instrument</title>
+<style>
+  :root {
+    --bg: #07070d;
+    --panel: #0b0b14;
+    --line: #23233a;
+    --ink: #c8c8d4;
+    --dim: #5c5c72;
+    --accent: #5ac882;
+    --rec: #e65c5c;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 50% -10%, #101024 0%, var(--bg) 60%);
+    color: var(--ink);
+    font-family: "Cascadia Mono", "IBM Plex Mono", ui-monospace, Consolas, monospace;
+    font-size: 13px;
+    display: grid;
+    place-items: center;
+    user-select: none;
+  }
+  main { display: grid; gap: 14px; justify-items: center; }
+  header {
+    width: 100%;
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  h1 {
+    font-size: 13px; font-weight: 400; letter-spacing: 0.25em;
+    text-transform: uppercase; color: var(--dim);
+  }
+  h1 b { color: var(--accent); font-weight: 400; }
+  #hud { color: var(--dim); }
+  .frame {
+    position: relative;
+    padding: 10px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    box-shadow: 0 0 80px rgba(90, 200, 130, 0.05), inset 0 0 40px rgba(0,0,0,0.6);
+  }
+  canvas {
+    display: block;
+    width: min(70vmin, 640px);
+    height: min(70vmin, 640px);
+    cursor: crosshair;
+    outline: 1px solid var(--line);
+  }
+  #start {
+    position: absolute; inset: 10px;
+    display: grid; place-items: center;
+    background: rgba(7, 7, 13, 0.88);
+    color: var(--accent);
+    border: none; font: inherit; letter-spacing: 0.25em; text-transform: uppercase;
+    cursor: pointer;
+  }
+  #start:hover { background: rgba(7, 7, 13, 0.75); }
+  footer {
+    width: 100%;
+    display: flex; justify-content: space-between; align-items: center; gap: 16px;
+  }
+  #status { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #clear, #camera {
+    font: inherit; color: var(--dim); background: none;
+    border: 1px solid var(--line); padding: 4px 12px; cursor: pointer;
+    letter-spacing: 0.1em; white-space: nowrap;
+  }
+  #clear:hover { color: var(--rec); border-color: var(--rec); }
+  #camera:hover { color: var(--accent); border-color: var(--accent); }
+  .legend { color: var(--dim); font-size: 11px; letter-spacing: 0.05em; }
+  .legend i { font-style: normal; }
+  .legend .r { color: var(--rec); }
+  .legend .g { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>gesture <b>instrument</b></h1>
+    <span id="hud">audio off</span>
+  </header>
+  <div class="frame">
+    <canvas id="pad" width="640" height="640"></canvas>
+    <button id="start">tap to start audio</button>
+  </div>
+  <footer>
+    <span id="status">·</span>
+    <span class="legend"><i class="r">left-drag / pinch</i> sing to teach &nbsp; <i class="g">right-drag / two fingers</i> play</span>
+    <button id="camera">camera: off</button>
+    <button id="clear">clear</button>
+  </footer>
+</main>
+<video id="cam" playsinline muted style="display:none"></video>
+<script src="/static/main.js"></script>
+</body>
+</html>
