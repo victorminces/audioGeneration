@@ -42,3 +42,7 @@ outputs/
 # OS
 .DS_Store
 Thumbs.db
+debug/
+.claude/
+bash.exe.stackdump
+__pycache__/
