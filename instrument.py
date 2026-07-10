@@ -1,4 +1,11 @@
-"""Gesture instrument — step 1: cursor-on-square, mapping by demonstration.
+"""Gesture instrument — mapping by demonstration (mouse or camera).
+
+Run with --camera to control with one hand via the webcam:
+  PINCH (thumb+index touching) = demonstrate: sing while moving; the pinch
+                                 point is the tracked coordinate.
+  TWO FINGERS (index+middle extended) = play live; the index fingertip is
+                                 the tracked coordinate.
+  Any other hand pose = idle. The mouse keeps working alongside.
 
 DEMONSTRATE: hold the LEFT mouse button, move the cursor and sing.
              Each take updates the gesture->voice map (ridge over RBF grid).
@@ -188,7 +195,7 @@ class LiveEngine:
     (reading the latest cursor + gate), the sound-card callback consumes them.
     Gate on = sound follows the cursor live; gate off = fade to silence."""
 
-    AHEAD = 4          # frames of cushion (~64 ms) between producer and card
+    AHEAD = 6          # frames of cushion (~96 ms) between producer and card
 
     def __init__(self, mapper):
         self.mapper = mapper
@@ -252,6 +259,51 @@ class LiveEngine:
         self.stream.stop(); self.stream.close()
 
 
+# ── camera hand tracking (separate process) ───────────────────────────────────
+
+class CameraProc:
+    """Camera + MediaPipe run in a child process (camtrack.py) with their own
+    interpreter and CPU core — no GIL contention with audio or UI. This process
+    only drains small queues."""
+
+    def __init__(self):
+        import multiprocessing as mp_
+        self.state_q = mp_.Queue()
+        self.frame_q = mp_.Queue()
+        self.stop_ev = mp_.Event()
+        import camtrack
+        self.proc = mp_.Process(target=camtrack.run,
+                                args=(self.state_q, self.frame_q, self.stop_ev),
+                                daemon=True)
+        self.proc.start()
+        self.state = (0.5, 0.5, None)          # x, y, gesture
+        self.fps = 0.0
+        self.frame_bgr = None
+        self.frame_id = 0
+        self.error = None
+
+    def poll(self):
+        """Drain queues; keep only the freshest state/frame."""
+        while not self.state_q.empty():
+            msg = self.state_q.get_nowait()
+            if msg[0] == "state":
+                _, x, y, g, fps = msg
+                self.state = (x, y, g)
+                self.fps = fps
+            elif msg[0] == "error":
+                self.error = msg[1]
+        while not self.frame_q.empty():
+            _, frame = self.frame_q.get_nowait()
+            self.frame_bgr = frame
+            self.frame_id += 1
+
+    def close(self):
+        self.stop_ev.set()
+        self.proc.join(timeout=2)
+        if self.proc.is_alive():
+            self.proc.terminate()
+
+
 # ── app ───────────────────────────────────────────────────────────────────────
 
 print("loading DDSP model…", flush=True)
@@ -291,14 +343,25 @@ def main():
     font = pygame.font.SysFont("consolas", 15)
     clock = pygame.time.Clock()
 
+    camera = None
+    if "--camera" in sys.argv:
+        print("starting camera…", flush=True)
+        camera = CameraProc()
+        print("camera on", flush=True)
+
     mapper = RBFMapper()
     take = None
+    cam_gesture = None                          # last raw gesture from camera
+    cam_gesture_t = time.perf_counter()         # when it last changed
+    cam_pos = (0.5, 0.5)
     mode = "idle"                               # idle | demo | trace
     status = "hold LEFT + sing to demonstrate; hold RIGHT to play"
     demo_paths, trace_path = [], []
     map_surface, show_map = None, True
     playback = None
     last_live = None
+    analysis_done = []                          # finished takes -> UI applies
+    cam_bg, cam_bg_id = None, -1
     engine = LiveEngine(mapper)                             # {"cur": (t,x,y) array, "start": t0, "dur": s}
 
     def to_unit(pos):
@@ -358,15 +421,16 @@ def main():
             elif ev.type == pygame.MOUSEBUTTONUP and mode != "idle":
                 audio, cur = take.stop()
                 if mode == "demo" and len(cur) > 5 and len(audio) > ddsp.SR // 2:
-                    status = "analyzing take…"; pygame.display.flip()
-                    t, targets = analyze_take(audio)
-                    t = t[t <= cur[-1, 0]]      # audio may outlast cursor
-                    xy = cursor_at(cur, t)
-                    mapper.add(xy, targets[:len(t)], seconds=len(audio) / ddsp.SR)
-                    map_surface = render_map_surface(mapper)
-                    demo_paths.append(cur[:, 1:])
-                    status = (f"map updated: {mapper.seconds:.1f}s total "
-                              f"({len(demo_paths)} takes)")
+                    status = "analyzing take (background)…"
+
+                    def _analyze(audio=audio, cur=cur):
+                        t, targets = analyze_take(audio)
+                        t = t[t <= cur[-1, 0]]  # audio may outlast cursor
+                        xy = cursor_at(cur, t)
+                        mapper.add(xy, targets[:len(t)], seconds=len(audio) / ddsp.SR)
+                        analysis_done.append(cur[:, 1:])
+
+                    threading.Thread(target=_analyze, daemon=True).start()
                 elif mode == "trace" and len(cur) > 5:
                     trace_path = cur[:, 1:]
                     last_live = cur
@@ -375,12 +439,48 @@ def main():
                               "released (P = clean offline replay of that path)")
                 mode, take = "idle", None
 
+        # camera gestures drive the same modes as the mouse buttons
+        if camera is not None:
+            camera.poll()
+            if camera.error:
+                status = f"camera process error: {camera.error.splitlines()[0]}"
+                camera = None
+            if camera is None:
+                cx_, cy_, g_raw = 0.5, 0.5, None
+            else:
+                cx_, cy_, g_raw = camera.state
+            cam_pos = (cx_, cy_)
+            now = time.perf_counter()
+            if g_raw != cam_gesture:
+                cam_gesture, cam_gesture_t = g_raw, now
+            want = {"pinch": "demo", "two": "trace"}.get(cam_gesture, "idle")
+            # quick to engage, slow to release: brief flickers don't end a take
+            hold = 0.12 if want != "idle" else 0.35
+            if want != mode and now - cam_gesture_t >= hold:
+                if mode != "idle" and take is not None:
+                    # close the current take exactly like a button release
+                    pygame.event.post(pygame.event.Event(
+                        pygame.MOUSEBUTTONUP, button=1 if mode == "demo" else 3))
+                if want == "demo":
+                    pygame.event.post(pygame.event.Event(
+                        pygame.MOUSEBUTTONDOWN, button=1))
+                elif want == "trace":
+                    pygame.event.post(pygame.event.Event(
+                        pygame.MOUSEBUTTONDOWN, button=3))
+
+        while analysis_done:                    # apply finished analyses (UI thread)
+            demo_paths.append(analysis_done.pop(0))
+            map_surface = render_map_surface(mapper)
+            status = (f"map updated: {mapper.seconds:.1f}s total "
+                      f"({len(demo_paths)} takes)")
+
         pos = pygame.mouse.get_pos()
         ux, uy = to_unit(pos)
+        if camera is not None and (mode != "idle" or cam_gesture is not None):
+            ux, uy = cam_pos                    # hand position wins when present
         engine.set(ux, uy, gate=(mode == "trace"))
         if mode != "idle" and take is not None:
-            x, y = to_unit(pos)
-            take.tick(x, y)
+            take.tick(ux, uy)
 
         # ── draw ──
         def decimate(pts, cap=300):
@@ -389,7 +489,16 @@ def main():
             return pts[::step]
 
         screen.fill((16, 16, 30))
+        if camera is not None and camera.frame_bgr is not None                 and camera.frame_id != cam_bg_id:
+            f = camera.frame_bgr[:, :, ::-1]                # BGR -> RGB, small
+            small = pygame.surfarray.make_surface(f.swapaxes(0, 1).copy())
+            cam_bg = pygame.transform.scale(small, (SIZE, SIZE))
+            cam_bg.fill((80, 80, 90), special_flags=pygame.BLEND_MULT)  # dim
+            cam_bg_id = camera.frame_id
+        if cam_bg is not None:
+            screen.blit(cam_bg, (MARGIN, MARGIN))
         if show_map and map_surface is not None:
+            map_surface.set_alpha(150 if cam_bg is not None else 255)
             screen.blit(map_surface, (MARGIN, MARGIN))
         pygame.draw.rect(screen, (60, 60, 100),
                          (MARGIN, MARGIN, SIZE, SIZE), width=1)
@@ -424,18 +533,26 @@ def main():
 
         color = {"idle": (150, 150, 170), "demo": (230, 90, 90),
                  "trace": (90, 200, 130)}[mode]
-        pygame.draw.circle(screen, color, pos, 6, width=0 if mode != "idle" else 1)
+        if camera is not None:
+            hp = (MARGIN + cam_pos[0] * SIZE, MARGIN + cam_pos[1] * SIZE)
+            pygame.draw.circle(screen, color, hp, 10, width=2)
+            pygame.draw.circle(screen, color, hp, 2)
+        else:
+            pygame.draw.circle(screen, color, pos, 6, width=0 if mode != "idle" else 1)
         screen.blit(font.render(status, True, (200, 200, 210)),
                     (MARGIN, SIZE + MARGIN + 12))
         screen.blit(font.render(
             f"map: {mapper.seconds:.1f}s | kernel {mapper.sigma:.2f} | "
             f"underruns {engine.underruns} | "
+            + (f"cam {camera.fps:.0f}fps [{cam_gesture or 'idle'}] | " if camera else "") +
             f"S save L load C clear M map P replay UP/DOWN detail Q quit",
             True, (120, 120, 140)), (MARGIN, SIZE + MARGIN + 34))
         pygame.display.flip()
         clock.tick(CURSOR_HZ)
 
     engine.close()
+    if camera is not None:
+        camera.close()
     pygame.quit()
 
 
