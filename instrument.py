@@ -344,7 +344,7 @@ def main():
     clock = pygame.time.Clock()
 
     camera = None
-    if "--camera" in sys.argv:
+    if "--no-camera" not in sys.argv:
         print("starting camera…", flush=True)
         camera = CameraProc()
         print("camera on", flush=True)
@@ -357,7 +357,8 @@ def main():
     mode = "idle"                               # idle | demo | trace
     status = "hold LEFT + sing to demonstrate; hold RIGHT to play"
     demo_paths, trace_path = [], []
-    map_surface, show_map = None, True
+    map_surface, show_map = None, False
+    cam_driving = False                         # current take started by camera?
     playback = None
     last_live = None
     analysis_done = []                          # finished takes -> UI applies
@@ -385,6 +386,14 @@ def main():
                     status = "map cleared"
                 elif ev.key == pygame.K_m:
                     show_map = not show_map
+                elif ev.key == pygame.K_v:
+                    if camera is None:
+                        status = "starting camera…"
+                        camera = CameraProc()
+                    else:
+                        camera.close()
+                        camera, cam_bg, cam_gesture = None, None, None
+                        status = "camera off"
                 elif ev.key in (pygame.K_UP, pygame.K_DOWN):
                     factor = 0.85 if ev.key == pygame.K_UP else 1 / 0.85
                     mapper.sigma = float(np.clip(mapper.sigma * factor, 0.03, 0.6))
@@ -411,6 +420,7 @@ def main():
                     map_surface = render_map_surface(mapper)
                     status = f"loaded session ({mapper.seconds:.0f}s, model {name})"
             elif ev.type == pygame.MOUSEBUTTONDOWN and mode == "idle":
+                cam_driving = getattr(ev, "cam", False)
                 if ev.button == 1:
                     mode, take = "demo", Take(record_audio=True)
                     status = "RECORDING — sing and move…"
@@ -456,17 +466,20 @@ def main():
             want = {"pinch": "demo", "two": "trace"}.get(cam_gesture, "idle")
             # quick to engage, slow to release: brief flickers don't end a take
             hold = 0.12 if want != "idle" else 0.35
-            if want != mode and now - cam_gesture_t >= hold:
+            # camera may start takes when idle, but only ends takes it started
+            # (a mouse-held take is never interrupted by the hand going idle)
+            if (want != mode and now - cam_gesture_t >= hold
+                    and (mode == "idle" or cam_driving)):
                 if mode != "idle" and take is not None:
                     # close the current take exactly like a button release
                     pygame.event.post(pygame.event.Event(
                         pygame.MOUSEBUTTONUP, button=1 if mode == "demo" else 3))
                 if want == "demo":
                     pygame.event.post(pygame.event.Event(
-                        pygame.MOUSEBUTTONDOWN, button=1))
+                        pygame.MOUSEBUTTONDOWN, button=1, cam=True))
                 elif want == "trace":
                     pygame.event.post(pygame.event.Event(
-                        pygame.MOUSEBUTTONDOWN, button=3))
+                        pygame.MOUSEBUTTONDOWN, button=3, cam=True))
 
         while analysis_done:                    # apply finished analyses (UI thread)
             demo_paths.append(analysis_done.pop(0))
@@ -476,8 +489,10 @@ def main():
 
         pos = pygame.mouse.get_pos()
         ux, uy = to_unit(pos)
-        if camera is not None and (mode != "idle" or cam_gesture is not None):
-            ux, uy = cam_pos                    # hand position wins when present
+        # hand position drives camera-started takes; the mouse drives its own
+        if camera is not None and (cam_driving if mode != "idle"
+                                   else cam_gesture is not None):
+            ux, uy = cam_pos
         engine.set(ux, uy, gate=(mode == "trace"))
         if mode != "idle" and take is not None:
             take.tick(ux, uy)
@@ -502,23 +517,16 @@ def main():
             screen.blit(map_surface, (MARGIN, MARGIN))
         pygame.draw.rect(screen, (60, 60, 100),
                          (MARGIN, MARGIN, SIZE, SIZE), width=1)
-        for path in demo_paths:                 # past demonstrations, dim
+        for path in demo_paths:                 # past demonstrations
             pts = [(MARGIN + p[0] * SIZE, MARGIN + p[1] * SIZE)
                    for p in decimate(path)]
             if len(pts) > 1:
-                pygame.draw.lines(screen, (70, 90, 70), False, pts, 1)
+                pygame.draw.lines(screen, (130, 190, 130), False, pts, 2)
         if mode == "demo" and take and len(take.cursor) > 1:
             pts = [(MARGIN + c[1] * SIZE, MARGIN + c[2] * SIZE)
                    for c in decimate(take.cursor)]
             pygame.draw.lines(screen, (220, 90, 90), False, pts, 2)
-        if mode == "trace" and take and len(take.cursor) > 1:
-            pts = [(MARGIN + c[1] * SIZE, MARGIN + c[2] * SIZE)
-                   for c in decimate(take.cursor)]
-            pygame.draw.lines(screen, (90, 200, 130), False, pts, 2)
-        elif len(trace_path) > 1:
-            pts = [(MARGIN + p[0] * SIZE, MARGIN + p[1] * SIZE)
-                   for p in decimate(np.atleast_2d(np.array(trace_path)))]
-            pygame.draw.lines(screen, (90, 200, 130), False, pts, 2)
+        # playing (trace mode) intentionally leaves no trace on screen
 
         if playback is not None:
             el = time.perf_counter() - playback["start"]
@@ -545,7 +553,7 @@ def main():
             f"map: {mapper.seconds:.1f}s | kernel {mapper.sigma:.2f} | "
             f"underruns {engine.underruns} | "
             + (f"cam {camera.fps:.0f}fps [{cam_gesture or 'idle'}] | " if camera else "") +
-            f"S save L load C clear M map P replay UP/DOWN detail Q quit",
+            f"S save L load C clear M map V camera P replay UP/DOWN detail Q quit",
             True, (120, 120, 140)), (MARGIN, SIZE + MARGIN + 34))
         pygame.display.flip()
         clock.tick(CURSOR_HZ)
