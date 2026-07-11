@@ -33,8 +33,12 @@ class Instrument extends AudioWorkletProcessor {
     this._initFFT(this.noiseFFT);
 
     // mapper (empty until the server sends one)
-    this.mapW = null;                        // Float32Array (nFeat * 18)
+    this.pts = null;                         // Float32Array, rows [x, y, ux, uy, 18 targets]
+    this.nPts = 0;
     this.nOut = 2 + this.C.Z_DIM;
+    this.sigma = 0.15;                       // across-stroke width
+    this.sigmaPar = 0.04;                    // along-stroke width (aniso mode)
+    this.fade = 0.0;                         // confidence gain (silence off-data)
 
     // control state (written by messages, read by the render loop)
     this.x = 0.5; this.y = 0.5;
@@ -67,23 +71,21 @@ class Instrument extends AudioWorkletProcessor {
 
   _onMessage(m) {
     if (m.type === "map") {
-      const g = m.grid, nFeat = g * g + 1;
       this.sigma = m.sigma;
-      this.centers = new Float32Array(nFeat * 2);
-      const xs = [];
-      for (let i = 0; i < g; i++) xs.push(g === 1 ? 0 : i / (g - 1));
-      for (let i = 0; i < g; i++)              // np.meshgrid 'xy' + ravel order
-        for (let j = 0; j < g; j++) {
-          this.centers[(i * g + j) * 2] = xs[j];
-          this.centers[(i * g + j) * 2 + 1] = xs[i];
-        }
-      if (m.W) {
-        this.mapW = new Float32Array(nFeat * this.nOut);
-        for (let i = 0; i < nFeat; i++)
-          for (let j = 0; j < this.nOut; j++)
-            this.mapW[i * this.nOut + j] = m.W[i][j];
+      this.sigmaPar = m.sigmaPar;
+      if (m.points && m.points.length) {
+        const stride = 4 + this.nOut;
+        this.nPts = m.points.length;
+        this.pts = new Float32Array(this.nPts * stride);
+        for (let i = 0; i < this.nPts; i++)
+          for (let j = 0; j < stride; j++)
+            this.pts[i * stride + j] = m.points[i][j];
+        if (m.mode !== "aniso")                 // round kernel: drop the tangents
+          for (let i = 0; i < this.nPts; i++) {
+            this.pts[i * stride + 2] = 0; this.pts[i * stride + 3] = 0;
+          }
       } else {
-        this.mapW = null;
+        this.pts = null; this.nPts = 0;
       }
     } else if (m.type === "pos") {
       this.x = m.x; this.y = m.y;
@@ -105,16 +107,30 @@ class Instrument extends AudioWorkletProcessor {
   }
 
   // ── mapper ────────────────────────────────────────────────────────────────
+  // Kernel smoothing: out = Gaussian-weighted average of the samples (so it
+  // never leaves the demonstrated range). Each sample's kernel is narrow along
+  // its stroke tangent (sigmaPar) and wide across it (sigma); zero tangents
+  // (round mode, crossings, stalls) make it round. Returns the kernel value at
+  // the nearest sample — a confidence in (0, 1] applied as an output gain.
   predict(out) {
-    const nFeat = this.centers.length / 2, s2 = 2 * this.sigma * this.sigma;
+    const sx2 = 2 * this.sigma * this.sigma;
+    const sp2 = 2 * this.sigmaPar * this.sigmaPar;
+    const stride = 4 + this.nOut, P = this.pts;
     out.fill(0);
-    for (let i = 0; i < nFeat - 1; i++) {
-      const dx = this.x - this.centers[2 * i], dy = this.y - this.centers[2 * i + 1];
-      const phi = Math.exp(-(dx * dx + dy * dy) / s2);
-      for (let j = 0; j < this.nOut; j++) out[j] += phi * this.mapW[i * this.nOut + j];
+    let sw = 0, wmax = 0;
+    for (let i = 0; i < this.nPts; i++) {
+      const o = i * stride;
+      const dx = this.x - P[o], dy = this.y - P[o + 1];
+      const along = dx * P[o + 2] + dy * P[o + 3];
+      const across2 = Math.max(dx * dx + dy * dy - along * along, 0);
+      const w = Math.exp(-along * along / sp2 - across2 / sx2);
+      sw += w;
+      if (w > wmax) wmax = w;
+      for (let j = 0; j < this.nOut; j++) out[j] += w * P[o + 4 + j];
     }
-    const b = (nFeat - 1) * this.nOut;
-    for (let j = 0; j < this.nOut; j++) out[j] += this.mapW[b + j];
+    const inv = 1 / (sw + 1e-12);
+    for (let j = 0; j < this.nOut; j++) out[j] *= inv;
+    return wmax;
   }
 
   // ── decoder ───────────────────────────────────────────────────────────────
@@ -218,14 +234,15 @@ class Instrument extends AudioWorkletProcessor {
     let newGain = this.gain + 0.35 * (this.gate - this.gain);   // ~50 ms ramp
     if (newGain < 1e-3 && this.gate === 0) newGain = 0;
 
-    if (newGain <= 0 || !this.mapW) {
+    if (newGain <= 0 || !this.pts) {
       this.gain = newGain;
+      this.fade = 0;
       this.resetSynth();
       return out;
     }
 
     const p = this._p;
-    this.predict(p);
+    const conf = this.predict(p);
     const f0 = Math.min(600, Math.max(60, Math.exp(p[0])));
     const amp = this.decodeFrame(f0, p[1], p.subarray(2));
     const harm = this._harm, H = this.C.N_HARMONICS;
@@ -253,10 +270,14 @@ class Instrument extends AudioWorkletProcessor {
 
     this.addNoise(out);
 
-    // gain ramp for gating (attack/release)
-    for (let i = 0; i < hop; i++)
-      out[i] *= this.gain + (newGain - this.gain) * (i + 1) / hop;
+    // gain ramp for gating (attack/release) x confidence fade (off-data silence)
+    for (let i = 0; i < hop; i++) {
+      const r = (i + 1) / hop;
+      out[i] *= (this.gain + (newGain - this.gain) * r)
+              * (this.fade + (conf - this.fade) * r);
+    }
     this.gain = newGain;
+    this.fade = conf;
 
     pv.f0 = f0; pv.amp = amp; pv.harm.set(harm);
     return out;

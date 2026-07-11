@@ -37,7 +37,7 @@ torch.set_num_threads(1)   # tiny per-frame ops: avoid thread-pool overhead
 PROJ = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJ)
 import ddsp  # noqa: E402
-from mapper import RBFMapper, load_latest_ddsp  # noqa: E402
+from mapper import KernelMapper, load_latest_ddsp  # noqa: E402
 
 SIZE        = 560                  # square size in px
 MARGIN      = 40
@@ -120,6 +120,7 @@ class LiveEngine:
         self.lock = threading.Lock()
         self.target = (0.5, 0.5, 0.0)          # x, y, gate
         self.gain = 0.0
+        self.fade = 0.0                        # confidence gain (off-data silence)
         self.underruns = 0
         self.running = True
         self.thread = threading.Thread(target=self._produce, daemon=True)
@@ -156,15 +157,19 @@ class LiveEngine:
             new_gain = self.gain + 0.35 * (gate - self.gain)   # ~50 ms ramp
             if new_gain < 1e-3 and gate == 0.0:
                 new_gain = 0.0
-            if new_gain <= 0.0 or self.mapper.W is None:
+            if new_gain <= 0.0 or not self.mapper.ready:
                 frame = np.zeros(ddsp.HOP, dtype=np.float32)
+                self.fade = 0.0
                 self.synth.reset()                # fresh state on next note
             else:
-                p = self.mapper.predict(np.array([[x, y]]))[0]
+                pred, conf = self.mapper.predict(np.array([[x, y]]))
+                p, c = pred[0], float(conf[0])
                 f0 = float(np.clip(np.exp(p[0]), 60, 600))
                 frame = self.synth.render(f0, float(p[1]), p[2:])
-                ramp = np.linspace(self.gain, new_gain, ddsp.HOP, dtype=np.float32)
+                ramp = (np.linspace(self.gain, new_gain, ddsp.HOP, dtype=np.float32)
+                        * np.linspace(self.fade, c, ddsp.HOP, dtype=np.float32))
                 frame = frame * ramp
+                self.fade = c
             self.gain = new_gain
             with self.lock:
                 self.buf.append(frame)
@@ -229,16 +234,17 @@ print(f"model: {MODEL_NAME}", flush=True)
 MAP_RES = 56
 
 def render_map_surface(mapper):
-    """Predicted pitch (hue) x loudness (brightness) over the square, or None."""
-    if mapper.W is None:
+    """Predicted pitch (hue) x loudness*confidence (brightness), or None."""
+    if not mapper.ready:
         return None
     g = (np.arange(MAP_RES) + 0.5) / MAP_RES
     gx, gy = np.meshgrid(g, g)
-    pred = mapper.predict(np.stack([gx.ravel(), gy.ravel()], axis=1))
+    pred, conf = mapper.predict(np.stack([gx.ravel(), gy.ravel()], axis=1))
     logf0 = pred[:, 0].reshape(MAP_RES, MAP_RES)
     loud  = pred[:, 1].reshape(MAP_RES, MAP_RES)
+    conf  = conf.reshape(MAP_RES, MAP_RES)
     hue = np.clip((logf0 - np.log(80)) / (np.log(500) - np.log(80)), 0, 1)
-    val = np.clip((loud + 7) / 6, 0.15, 1.0)
+    val = np.clip((loud + 7) / 6 * conf, 0.15, 1.0)
     # simple HSV->RGB (S=0.85), vectorized
     h6 = hue * 5.0                              # blue(low) -> red(high) span
     c = val * 0.85
@@ -265,7 +271,7 @@ def main():
         camera = CameraProc()
         print("camera on", flush=True)
 
-    mapper = RBFMapper()
+    mapper = KernelMapper()
     take = None
     cam_gesture = None                          # last raw gesture from camera
     cam_gesture_t = time.perf_counter()         # when it last changed
@@ -296,7 +302,7 @@ def main():
                 if ev.key in (pygame.K_q, pygame.K_ESCAPE):
                     running = False
                 elif ev.key == pygame.K_c:
-                    mapper = RBFMapper(); demo_paths = []
+                    mapper = KernelMapper(); demo_paths = []
                     engine.set_mapper(mapper)
                     map_surface = None
                     status = "map cleared"
@@ -313,19 +319,31 @@ def main():
                 elif ev.key in (pygame.K_UP, pygame.K_DOWN):
                     factor = 0.85 if ev.key == pygame.K_UP else 1 / 0.85
                     mapper.sigma = float(np.clip(mapper.sigma * factor, 0.03, 0.6))
-                    mapper.refit()
                     map_surface = render_map_surface(mapper)
-                    status = f"kernel width: {mapper.sigma:.3f} (UP=sharper DOWN=smoother)"
+                    status = f"across width: {mapper.sigma:.3f} (UP=sharper DOWN=smoother)"
+                elif ev.key in (pygame.K_LEFT, pygame.K_RIGHT):
+                    factor = 0.85 if ev.key == pygame.K_LEFT else 1 / 0.85
+                    mapper.sigma_par = float(np.clip(mapper.sigma_par * factor, 0.01, 0.3))
+                    map_surface = render_map_surface(mapper)
+                    status = f"along width: {mapper.sigma_par:.3f} (LEFT=sharper RIGHT=smoother)"
+                elif ev.key == pygame.K_k:
+                    mapper.mode = "iso" if mapper.mode == "aniso" else "aniso"
+                    map_surface = render_map_surface(mapper)
+                    status = f"kernel mode: {'directional' if mapper.mode == 'aniso' else 'round'}"
                 elif ev.key == pygame.K_s:
                     mapper.save(session_path, MODEL_NAME)
                     status = f"saved {os.path.basename(session_path)}"
-                elif ev.key == pygame.K_p and last_live is not None and mapper.W is not None:
+                elif ev.key == pygame.K_p and last_live is not None and mapper.ready:
                     cur = last_live
                     dur = cur[-1, 0]
                     t = np.arange(int(dur * ddsp.SR / ddsp.HOP)) * ddsp.HOP / ddsp.SR
                     if len(t) > 2:
                         status = "synthesizing replay…"; pygame.display.flip()
-                        out = synthesize_targets(mapper.predict(cursor_at(cur, t)))
+                        pred, conf = mapper.predict(cursor_at(cur, t))
+                        out = synthesize_targets(pred)
+                        gain = np.repeat(conf, ddsp.HOP).astype(np.float32)
+                        n = min(len(out), len(gain))
+                        out = out[:n] * gain[:n]
                         sd.play(out, ddsp.SR)
                         playback = {"cur": cur, "start": time.perf_counter(),
                                     "dur": len(out) / ddsp.SR}
@@ -361,7 +379,7 @@ def main():
                     trace_path = cur[:, 1:]
                     last_live = cur
                     status = ("no map yet — demonstrate first"
-                              if mapper.W is None else
+                              if not mapper.ready else
                               "released (P = clean offline replay of that path)")
                 mode, take = "idle", None
 
@@ -466,10 +484,11 @@ def main():
         screen.blit(font.render(status, True, (200, 200, 210)),
                     (MARGIN, SIZE + MARGIN + 12))
         screen.blit(font.render(
-            f"map: {mapper.seconds:.1f}s | kernel {mapper.sigma:.2f} | "
+            f"map: {mapper.seconds:.1f}s | {mapper.mode} "
+            f"across {mapper.sigma:.2f} along {mapper.sigma_par:.2f} | "
             f"underruns {engine.underruns} | "
             + (f"cam {camera.fps:.0f}fps [{cam_gesture or 'idle'}] | " if camera else "") +
-            f"S save L load C clear M map V camera P replay UP/DOWN detail Q quit",
+            f"S save L load C clear M map V camera P replay K kernel arrows widths Q quit",
             True, (120, 120, 140)), (MARGIN, SIZE + MARGIN + 34))
         pygame.display.flip()
         clock.tick(CURSOR_HZ)

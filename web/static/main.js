@@ -10,7 +10,7 @@ const hudEl = document.getElementById("hud");
 
 let node = null;                // AudioWorkletNode
 let audioCtx = null;
-let state = { seconds: 0, model: "…", sigma: 0, W: null };
+let state = { seconds: 0, model: "…", mode: "aniso", sigma: 0.15, sigma_par: 0.04, points: null };
 let demoPaths = [];             // [[x,y],...] per finished take
 let mode = "idle";              // idle | demo | trace
 let cursor = [];                // [t, x, y] during a take
@@ -24,9 +24,47 @@ function setStatus(s) { statusEl.textContent = s; }
 function hud() {
   hudEl.textContent =
     `model ${state.model}  ·  map ${state.seconds.toFixed(1)}s  ·  ` +
-    `kernel ${state.sigma.toFixed(3)}  ·  ` +
     (audioCtx ? `${audioCtx.sampleRate} Hz` : "audio off");
 }
+
+// ── kernel controls ─────────────────────────────────────────────────────────
+const modeEl = document.getElementById("mode");
+const sigxEl = document.getElementById("sigx"), sigxV = document.getElementById("sigxv");
+const sigpEl = document.getElementById("sigp"), sigpV = document.getElementById("sigpv");
+
+function syncControls() {
+  modeEl.value = state.mode;
+  sigxEl.value = state.sigma;
+  sigpEl.value = state.sigma_par;
+  sigxV.textContent = state.sigma.toFixed(3);
+  sigpV.textContent = state.sigma_par.toFixed(3);
+  const aniso = state.mode === "aniso";
+  sigpEl.disabled = !aniso;
+  document.getElementById("sigpRow").style.opacity = aniso ? 1 : 0.35;
+}
+
+let configBusy = false;
+async function postConfig(fields) {
+  if (configBusy) return;
+  configBusy = true;
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(fields)) fd.append(k, String(v));
+  try {
+    state = await fetch("/api/config", { method: "POST", body: fd }).then(r => r.json());
+    sendMap();
+  } catch (err) {
+    setStatus("server error: " + err.message);
+  }
+  configBusy = false;
+  syncControls();
+  hud();
+}
+
+modeEl.addEventListener("change", () => postConfig({ mode: modeEl.value }));
+sigxEl.addEventListener("input", () => { sigxV.textContent = (+sigxEl.value).toFixed(3); });
+sigpEl.addEventListener("input", () => { sigpV.textContent = (+sigpEl.value).toFixed(3); });
+sigxEl.addEventListener("change", () => postConfig({ sigma: sigxEl.value }));
+sigpEl.addEventListener("change", () => postConfig({ sigma_par: sigpEl.value }));
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
@@ -39,7 +77,8 @@ async function boot() {
   state = st;
 
   audioCtx = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
-  await audioCtx.audioWorklet.addModule("/static/worklet.js");
+  // cache-bust: addModule ignores hard-refresh, so pin the worklet version
+  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=3");
   node = new AudioWorkletNode(audioCtx, "instrument", {
     numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { manifest, weights: weightsBuf, constants: manifest.constants },
@@ -48,6 +87,7 @@ async function boot() {
   node.connect(audioCtx.destination);
 
   sendMap();
+  syncControls();
   hud();
   setStatus("allow the microphone to demonstrate…");
 
@@ -63,7 +103,8 @@ async function boot() {
 }
 
 function sendMap() {
-  node.port.postMessage({ type: "map", W: state.W, sigma: state.sigma, grid: state.grid });
+  node.port.postMessage({ type: "map", points: state.points, mode: state.mode,
+                          sigma: state.sigma, sigmaPar: state.sigma_par });
 }
 
 function onWorklet(m) {
@@ -125,7 +166,7 @@ function startTake(kind, byCam) {
     setStatus("RECORDING — sing and move…");
   } else {
     node.port.postMessage({ type: "gate", on: true });
-    setStatus(state.W ? "LIVE — sound follows the cursor"
+    setStatus(state.points ? "LIVE — sound follows the cursor"
                       : "no map yet — demonstrate first (left-drag + sing)");
   }
 }
@@ -273,25 +314,13 @@ async function toggleCamera() {
 
 camBtn.addEventListener("click", toggleCamera);
 
-// UP = sharper (smaller kernel), DOWN = smoother — same as the desktop app
-let sigmaBusy = false;
-document.addEventListener("keydown", async (ev) => {
+// UP = sharper (smaller across-width), DOWN = smoother; the sliders do the rest
+document.addEventListener("keydown", (ev) => {
   if (ev.key !== "ArrowUp" && ev.key !== "ArrowDown") return;
   ev.preventDefault();
-  if (sigmaBusy || !node) return;
-  sigmaBusy = true;
+  if (!node) return;
   const factor = ev.key === "ArrowUp" ? 0.85 : 1 / 0.85;
-  const fd = new FormData();
-  fd.append("sigma", String(state.sigma * factor));
-  try {
-    state = await fetch("/api/sigma", { method: "POST", body: fd }).then(r => r.json());
-    sendMap();
-    setStatus(`kernel width: ${state.sigma.toFixed(3)} (UP=sharper DOWN=smoother)`);
-    hud();
-  } catch (err) {
-    setStatus("server error: " + err.message);
-  }
-  sigmaBusy = false;
+  postConfig({ sigma: state.sigma * factor });
 });
 
 document.getElementById("clear").addEventListener("click", async () => {

@@ -1,8 +1,21 @@
 """Gesture->voice mapping shared by the desktop instrument and the web server.
 
-RBFMapper: ridge regression from (x, y) in [0,1]^2 to voice parameters
-[log_f0, loudness, z_1..z_16] over a fixed grid of Gaussian bumps.
-Incremental: accumulates raw pairs; solves in closed form on demand.
+KernelMapper: kernel smoothing (Nadaraya-Watson) from (x, y) in [0,1]^2 to
+voice parameters [log_f0, loudness, z_1..z_16]. The prediction at a point is
+the Gaussian-weighted average of the demonstrated samples, so it can never
+leave the range of what was actually sung. A confidence — the kernel value at
+the nearest sample — fades the instrument to silence away from the data.
+
+Two kernel modes:
+  "iso"    round Gaussian, one width (sigma).
+  "aniso"  Gaussian oriented by the local direction of travel: narrow along
+           the stroke (sigma_par, keeps consecutive sounds from smearing),
+           wide across it (sigma, the reach before fading to silence).
+
+Samples are thinned into small spatial bins (mean per bin) so prediction cost
+stays bounded no matter how long the demonstrations run. Tangents that
+disagree within a bin (path crossings) average toward zero, which gracefully
+falls back to round behavior there.
 """
 import glob
 import json
@@ -13,29 +26,27 @@ import torch
 
 import ddsp
 
-GRID      = 8                  # RBF grid (GRID x GRID bumps)
-RIDGE_LAM = 1e-2
+BIN_RES = 48                   # thinning grid: bins of 1/BIN_RES on a side
+MODES = ("iso", "aniso")
 
 
-class RBFMapper:
+class KernelMapper:
     N_OUT = 2 + ddsp.Z_DIM
 
     def __init__(self):
-        cx, cy = np.meshgrid(np.linspace(0, 1, GRID), np.linspace(0, 1, GRID))
-        self.centers = np.stack([cx.ravel(), cy.ravel()], axis=1)   # (G^2, 2)
-        self.sigma = 1.2 / GRID
-        self.lam = RIDGE_LAM
-        self.n_feat = GRID * GRID + 1
-        self.data_xy = []                       # raw pairs, kept so sigma/lam
-        self.data_t = []                        # can be changed after the fact
-        self.W = None
+        self.mode = "aniso"
+        self.sigma = 0.15                       # across-stroke width (iso: only width)
+        self.sigma_par = 0.04                   # along-stroke width (aniso only)
+        self.data_xy = []                       # raw per-take pairs, kept for
+        self.data_t = []                        # save/load and re-thinning
+        self.S = None                           # (M, 2) thinned sample positions
+        self.U = None                           # (M, 2) unit tangents (0 where unclear)
+        self.T = None                           # (M, N_OUT) thinned targets
         self.seconds = 0.0
 
-    def features(self, xy):
-        """(N, 2) -> (N, n_feat)"""
-        d2 = ((xy[:, None, :] - self.centers[None, :, :]) ** 2).sum(axis=2)
-        phi = np.exp(-d2 / (2 * self.sigma ** 2))
-        return np.concatenate([phi, np.ones((len(xy), 1))], axis=1)
+    @property
+    def ready(self):
+        return self.S is not None
 
     def add(self, xy, targets, seconds):
         self.data_xy.append(xy)
@@ -44,31 +55,73 @@ class RBFMapper:
         self.refit()
 
     def refit(self):
+        """Rebuild the thinned sample set (one mean sample per occupied bin)."""
         if not self.data_xy:
-            self.W = None
+            self.S = self.U = self.T = None
             return
-        X = self.features(np.concatenate(self.data_xy))
-        Y = np.concatenate(self.data_t)
-        reg = self.lam * len(X) * np.eye(self.n_feat)
-        self.W = np.linalg.solve(X.T @ X + reg, X.T @ Y)
+        xy = np.concatenate(self.data_xy)
+        t = np.concatenate(self.data_t)
+        # local direction of travel, per take so takes don't bleed into each other
+        u = np.concatenate([self._tangents(a) for a in self.data_xy])
+        idx = np.minimum((xy * BIN_RES).astype(np.int64), BIN_RES - 1)
+        flat = idx[:, 0] * BIN_RES + idx[:, 1]
+        order = np.argsort(flat, kind="stable")
+        flat, xy, t, u = flat[order], xy[order], t[order], u[order]
+        _, starts = np.unique(flat, return_index=True)
+        self.S = np.stack([g.mean(axis=0) for g in np.split(xy, starts[1:])])
+        self.T = np.stack([g.mean(axis=0) for g in np.split(t, starts[1:])])
+        um = np.stack([g.mean(axis=0) for g in np.split(u, starts[1:])])
+        n = np.linalg.norm(um, axis=1, keepdims=True)
+        # crossings/stalls average out -> keep zero (falls back to round kernel)
+        self.U = np.where(n > 0.25, um / (n + 1e-12), 0.0)
+
+    @staticmethod
+    def _tangents(xy):
+        """(N, 2) path -> (N, 2) unit tangents; zero where the hand stood still.
+        Tangent sign doesn't matter (the kernel uses its square)."""
+        if len(xy) < 2:
+            return np.zeros_like(xy)
+        g = np.gradient(xy, axis=0)
+        n = np.linalg.norm(g, axis=1, keepdims=True)
+        return np.where(n > 1e-4, g / (n + 1e-12), 0.0)
 
     def predict(self, xy):
-        if self.W is None:
+        """(N, 2) -> (pred (N, N_OUT), conf (N,)) or None if no data.
+
+        pred is the kernel-weighted average of the samples; conf is the kernel
+        value at the nearest sample (1 on the data, ->0 away from it), meant to
+        be applied as an output gain."""
+        if self.S is None:
             return None
-        return self.features(xy) @ self.W       # (N, N_OUT)
+        d = xy[:, None, :] - self.S[None, :, :]             # (N, M, 2)
+        d2 = (d ** 2).sum(axis=2)
+        if self.mode == "aniso":
+            along = (d * self.U[None, :, :]).sum(axis=2)    # offset along tangent
+            across2 = np.maximum(d2 - along ** 2, 0.0)
+            e = (along ** 2 / (2 * self.sigma_par ** 2)
+                 + across2 / (2 * self.sigma ** 2))
+        else:
+            e = d2 / (2 * self.sigma ** 2)
+        k = np.exp(-e)
+        sw = k.sum(axis=1)
+        conf = k.max(axis=1)
+        pred = (k @ self.T) / (sw[:, None] + 1e-12)
+        return pred, conf
 
     def save(self, path, ddsp_name):
         np.savez(path,
                  xy=np.concatenate(self.data_xy) if self.data_xy else np.zeros((0, 2)),
                  t=np.concatenate(self.data_t) if self.data_t else np.zeros((0, self.N_OUT)),
-                 sigma=self.sigma, lam=self.lam,
+                 sigma=self.sigma, sigma_par=self.sigma_par, mode=self.mode,
                  seconds=self.seconds, ddsp_name=ddsp_name)
 
     def load(self, path):
         z = np.load(path, allow_pickle=True)
         self.data_xy = [z["xy"]] if len(z["xy"]) else []
         self.data_t = [z["t"]] if len(z["t"]) else []
-        self.sigma = float(z["sigma"]); self.lam = float(z["lam"])
+        self.sigma = float(z["sigma"])
+        self.sigma_par = float(z["sigma_par"]) if "sigma_par" in z else 0.04
+        self.mode = str(z["mode"]) if "mode" in z else "aniso"
         self.seconds = float(z["seconds"])
         self.refit()
         return str(z["ddsp_name"])

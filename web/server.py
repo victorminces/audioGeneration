@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJ)
 import ddsp                                     # noqa: E402
-from mapper import RBFMapper, load_latest_ddsp  # noqa: E402
+from mapper import KernelMapper, load_latest_ddsp  # noqa: E402
 
 torch.set_num_threads(2)
 
@@ -33,7 +33,7 @@ print("loading DDSP model…", flush=True)
 MODEL, MODEL_NAME = load_latest_ddsp(PROJ)
 print(f"model: {MODEL_NAME}", flush=True)
 
-MAPPER = RBFMapper()
+MAPPER = KernelMapper()
 LOCK = threading.Lock()
 
 # decoder weights, flattened once in a fixed order the worklet knows
@@ -60,9 +60,13 @@ app = FastAPI()
 
 def state_json():
     return {
-        "W": MAPPER.W.tolist() if MAPPER.W is not None else None,
+        # one row per thinned sample: [x, y, ux, uy, log_f0, loud, z_1..z_16]
+        # (ux, uy) = unit tangent of the stroke there; (0, 0) = no direction
+        "points": (np.concatenate([MAPPER.S, MAPPER.U, MAPPER.T], axis=1).tolist()
+                   if MAPPER.ready else None),
+        "mode": MAPPER.mode,
         "sigma": MAPPER.sigma,
-        "grid": int(np.sqrt(MAPPER.n_feat - 1)),
+        "sigma_par": MAPPER.sigma_par,
         "seconds": MAPPER.seconds,
         "model": MODEL_NAME,
     }
@@ -118,11 +122,16 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
         return {"ok": True, "path": xy.tolist(), **state_json()}
 
 
-@app.post("/api/sigma")
-def post_sigma(sigma: float = Form(...)):
+@app.post("/api/config")
+def post_config(mode: str = Form(None), sigma: float = Form(None),
+                sigma_par: float = Form(None)):
     with LOCK:
-        MAPPER.sigma = float(np.clip(sigma, 0.03, 0.6))
-        MAPPER.refit()
+        if mode in ("iso", "aniso"):
+            MAPPER.mode = mode
+        if sigma is not None:
+            MAPPER.sigma = float(np.clip(sigma, 0.03, 0.6))
+        if sigma_par is not None:
+            MAPPER.sigma_par = float(np.clip(sigma_par, 0.01, 0.3))
         return state_json()
 
 
@@ -130,7 +139,7 @@ def post_sigma(sigma: float = Form(...)):
 def post_clear():
     global MAPPER
     with LOCK:
-        MAPPER = RBFMapper()
+        MAPPER = KernelMapper()
         return state_json()
 
 
