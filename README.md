@@ -1,41 +1,68 @@
-# Generative Sound
+# Gesture Instrument
 
-A Streamlit app for training waveform autoencoders (AE and VAE) and exploring latent space interpolation between audio clips.
+A camera- and mouse-driven instrument: sing a short phrase while drawing a
+gesture, and the instrument learns to map that 2D gesture back to the sound
+you sang. Afterwards, moving through the same space — with a hand tracked by
+your webcam, or a mouse — replays a continuous, gesture-controlled version of
+what you taught it.
 
-## What it does
+Open `http://127.0.0.1:8321` (see Running, below) and:
 
-- **Train** an autoencoder or VAE on your own audio files (WAV/FLAC)
-- **Reconstruct** audio through the bottleneck to hear compression quality
-- **Interpolate** between two sounds by walking through the latent space
-- **Compare** multiple trained models side by side
-- Download public datasets (LibriSpeech, Speech Commands, NSynth) directly from the app
+- **Sing to teach**: hold left-drag (mouse) or a pinch (hand) while singing,
+  drawing the sound's path through the 2D space as you go.
+- **Play**: move the cursor/hand through that space; the instrument
+  synthesizes pitch/timbre/loudness for wherever you are, continuously.
 
 ## Architecture
 
-1D convolutional encoder/decoder operating on raw waveforms at 16 kHz. Clips are 50 ms (800 samples). The encoder downsamples 16× through 4 conv layers; the decoder mirrors it with transposed convolutions. The VAE variant uses a dual-head encoder (mu + logvar) with reparameterization, free-bits KL flooring, and configurable β.
-
-## Known limitations
-
-### Interpolation sounds like addition of both sounds
-
-The core problem with waveform-domain interpolation. When two audio clips have different phases, linearly mixing their waveforms (or their latent representations) causes phase interference — the result sounds like both sounds playing simultaneously rather than a smooth morph between them.
-
-Spherical interpolation (slerp) is available as a toggle but does not fully solve this, because the issue is not the interpolation geometry but the fact that the decoder must produce a single coherent-phase waveform from a latent point that sits between two phase-misaligned encodings.
-
-**The real fix:** move to the spectrogram domain. Encoding magnitude spectrograms (e.g. mel spectrograms) avoids the phase problem — interpolating magnitudes produces smooth timbral blends, and audio is reconstructed with Griffin-Lim or a learned vocoder. This is how production audio VAEs (RAVE, EnCodec, etc.) approach the problem.
-
-### KL loss and latent space regularity
-
-With β=0.001 the VAE behaves almost like a plain autoencoder — the latent space is not regularized enough for smooth interpolation. Increasing β (tried up to 0.01) tightens the space but does not eliminate the phase problem described above.
-
-### Short clip length
-
-50 ms clips are too short to capture harmonic and timbral structure reliably. Longer clips (200–500 ms) would give the encoder more context but require more memory and longer training.
+- **Gesture -> voice mapping** ([mapper.py](mapper.py)): kernel smoothing
+  (Nadaraya-Watson) over the demonstrated (x, y) -> (pitch, loudness, timbre)
+  samples. The prediction at any point is a weighted average of nearby
+  demonstrations, so it can never extrapolate wildly — and a confidence value
+  (the kernel weight at the nearest sample) fades the instrument to silence
+  away from anything you've taught it. Two kernel modes: isotropic (round) or
+  anisotropic (narrow along the stroke direction, wide across it, so
+  consecutive sounds in a stroke don't blur together).
+- **Voice synthesis** ([ddsp.py](ddsp.py)): a DDSP model (Engel et al., ICLR
+  2020) — harmonic-plus-noise synthesis from per-frame (f0, loudness, timbre
+  latent z). Trained end-to-end through the synthesizer with a multi-scale
+  spectral loss; outputs waveform directly, no phase reconstruction needed.
+- **Everything real-time runs in the browser**: the gesture map evaluation
+  and the DDSP decoder both execute in an `AudioWorklet`
+  ([web/static/worklet.js](web/static/worklet.js)) for glitch-free audio.
+  The server only serves the decoder weights once and handles the
+  "sing to teach" analysis step.
+- **Hand tracking** is MediaPipe's `HandLandmarker`, running client-side in
+  the browser (loaded from a CDN; the model file itself is served locally by
+  the backend, see `models/hand_landmarker.task`).
 
 ## Running
 
 ```bash
-python -m streamlit run app.py
+pip install -r requirements.txt
+cd web
+python server.py       # or: uvicorn server:app --port 8321
 ```
 
-Requires: `torch`, `streamlit`, `soundfile`, `numpy`, `audio-recorder-streamlit`, `requests`
+Then open `http://127.0.0.1:8321` in a browser with webcam/microphone
+permissions available.
+
+## Reproducing the DDSP model
+
+The DDSP checkpoint that ships with this repo lives in `checkpoints/`
+(gitignored — not part of the repo itself). To retrain it from scratch:
+
+```bash
+# 1. Get training audio (LibriSpeech by default) into data/raw/
+python download_data.py --dataset librispeech --max-files 500
+
+# 2. Train. Analyzes clips into (f0, loudness, mel) once (slow — torchcrepe
+#    pitch tracking) and caches the result, then trains the DDSP model.
+python train_ddsp.py
+```
+
+`train_ddsp.py` saves `checkpoints/<name>.pt` + `<name>.json`; the server
+always picks up the newest checkpoint whose config has `"domain": "ddsp"`.
+Key options (see `python train_ddsp.py --help`): `--steps`, `--batch-size`,
+`--lr`, `--clip-seconds`. A quick smoke test: `python train_ddsp.py --steps
+200 --batch-size 8`.

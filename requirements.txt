@@ -1,5 +1,8 @@
 torch
 torchaudio
 soundfile
-streamlit
-audio-recorder-streamlit
+torchcrepe
+fastapi
+uvicorn
+python-multipart
+requests
