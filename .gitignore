@@ -26,11 +26,13 @@ data/processed/
 *.aif
 *.aiff
 
-# Model checkpoints
-checkpoints/
+# Model checkpoints (except the shipped default DDSP model, see README)
+checkpoints/*
 *.pt
 *.pth
 *.ckpt
+!checkpoints/ddsp_003.pt
+!checkpoints/ddsp_003.json
 
 # Outputs
 outputs/
