@@ -10,6 +10,8 @@ Usage:
     python download_data.py --dataset librispeech   # populate data/raw/ first
     python train_ddsp.py                             # defaults: 20000 steps, 2s clips
     python train_ddsp.py --steps 200 --batch-size 8   # quick smoke test
+    python train_ddsp.py --resume ddsp_003 --steps 2000   # train 2000 more steps
+                                                            # on top of ddsp_003
 """
 import argparse
 import glob
@@ -115,19 +117,56 @@ def train(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ddsp.DDSP().to(device)
+
+    start_step = 0
+    loss_history = []
+    name = args.out_name or args.resume or _next_name()
+    if args.resume:
+        resume_pt = os.path.join(CHECKPOINT_DIR, f"{args.resume}.pt")
+        resume_json = os.path.join(CHECKPOINT_DIR, f"{args.resume}.json")
+        with open(resume_json) as f:
+            prev_cfg = json.load(f)
+        start_step = prev_cfg.get("steps_done", prev_cfg.get("steps", 0))
+        loss_history = prev_cfg.get("loss_history", [])
+        model.load_state_dict(torch.load(resume_pt, map_location=device))
+        print(f"Resuming from {args.resume} at step {start_step}")
+
+    target_step = start_step + args.steps
+
+    # Fresh optimizer + a full cosine anneal over just this phase's steps
+    # (matches this codebase's existing Train/Continue convention).
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps,
                                                            eta_min=1e-5)
 
-    loss_history = []
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    def save(step_done):
+        pt_path = os.path.join(CHECKPOINT_DIR, f"{name}.pt")
+        torch.save(model.state_dict(), pt_path)
+        cfg = {
+            "name": name, "filename": f"{name}.pt",
+            "domain": "ddsp", "model_type": "ddsp", "arch": "ddsp",
+            "latent_ch": ddsp.Z_DIM, "latent_units": ddsp.Z_DIM,
+            "steps": target_step, "steps_done": step_done,
+            "batch_size": args.batch_size, "lr": args.lr,
+            "clip_seconds": args.clip_seconds, "val_frac": args.val_frac,
+            "clips_used": n, "loss_history": loss_history,
+            "note": f"DDSP harmonic+noise, timbre z={ddsp.Z_DIM}, trained via train_ddsp.py"
+                   + ("" if step_done == target_step else " (in progress)"),
+        }
+        with open(os.path.join(CHECKPOINT_DIR, f"{name}.json"), "w") as f:
+            json.dump(cfg, f, indent=2)
+        return pt_path
+
     report_every = max(1, args.steps // 40)
-    step = 0
+    step = start_step
     recon_loss_val = 0.0
 
-    while step < args.steps:
+    while step < target_step:
         model.train()
         for wav_b, f0_b, loud_b, mel_b in train_loader:
-            if step >= args.steps:
+            if step >= target_step:
                 break
             wav_b, f0_b, loud_b, mel_b = (t.to(device) for t in (wav_b, f0_b, loud_b, mel_b))
 
@@ -141,7 +180,7 @@ def train(args):
             scheduler.step()
             step += 1
 
-            if step % report_every == 0 or step == args.steps:
+            if step % report_every == 0 or step == target_step:
                 model.eval()
                 with torch.no_grad():
                     v_losses = []
@@ -153,29 +192,14 @@ def train(args):
                 val_loss = sum(v_losses) / len(v_losses)
                 model.train()
 
-                print(f"step {step:6d}/{args.steps} | recon {recon_loss_val:.4f} | "
+                print(f"step {step:6d}/{target_step} | recon {recon_loss_val:.4f} | "
                       f"val {val_loss:.4f}")
                 loss_history.append({"step": step, "recon": round(recon_loss_val, 5),
                                      "val_recon": round(val_loss, 5)})
 
-    name = args.out_name or _next_name()
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    pt_path = os.path.join(CHECKPOINT_DIR, f"{name}.pt")
-    torch.save(model.state_dict(), pt_path)
+                pt_path = save(step)
+                print(f"  saved {pt_path} (steps_done={step})")
 
-    cfg = {
-        "name": name, "filename": f"{name}.pt",
-        "domain": "ddsp", "model_type": "ddsp", "arch": "ddsp",
-        "latent_ch": ddsp.Z_DIM, "latent_units": ddsp.Z_DIM,
-        "steps": args.steps, "batch_size": args.batch_size, "lr": args.lr,
-        "clip_seconds": args.clip_seconds, "val_frac": args.val_frac,
-        "clips_used": n, "loss_history": loss_history,
-        "note": f"DDSP harmonic+noise, timbre z={ddsp.Z_DIM}, trained via train_ddsp.py",
-    }
-    with open(os.path.join(CHECKPOINT_DIR, f"{name}.json"), "w") as f:
-        json.dump(cfg, f, indent=2)
-
-    print(f"Saved {pt_path} ({name}.json)")
     return name
 
 
@@ -188,12 +212,17 @@ def main():
     parser.add_argument("--rebuild-cache", action="store_true",
                         help="Recompute the feature cache even if it already exists")
     parser.add_argument("--clip-seconds", type=float, default=2.0)
-    parser.add_argument("--steps", type=int, default=20000)
+    parser.add_argument("--steps", type=int, default=20000,
+                        help="Steps to train this phase (additional steps, if --resume is set)")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--out-name", default=None,
-                        help="Checkpoint name (default: auto-incrementing ddsp_NNN)")
+                        help="Checkpoint name (default: --resume's name, or an "
+                             "auto-incrementing ddsp_NNN for a fresh run)")
+    parser.add_argument("--resume", default=None,
+                        help="Existing checkpoint name to continue training from "
+                             "(e.g. ddsp_003)")
     args = parser.parse_args()
     train(args)
 
