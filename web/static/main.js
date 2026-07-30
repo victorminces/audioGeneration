@@ -225,6 +225,16 @@ let camGestureT = 0;            // when it last changed
 let lastSeen = 0;               // last time a hand was detected
 let lastVideoTime = -1;
 
+// Inference throttling (same approach as mflow's useHandTracking): never run
+// detectForVideo faster than a ~30fps ceiling — pinch/two gestures don't
+// benefit from more — and back off proportionally on slow devices so a weak
+// CPU degrades to a lower tracking rate instead of pinning the main thread
+// (which would otherwise compete with drawing and network calls here).
+const CAM_MIN_INTERVAL_MS = 33;
+const CAM_ADAPTIVE_HEADROOM = 1.5;
+let camInferenceInterval = CAM_MIN_INTERVAL_MS;
+let lastInferenceRun = 0;
+
 // pinch enters at 0.35 / exits at 0.50; "two" relaxes once active (hysteresis,
 // same constants as camtrack.py) so landmark jitter doesn't flicker takes
 function classify(lm, prev) {
@@ -245,9 +255,13 @@ function classify(lm, prev) {
 
 function camFrame(now) {
   if (!camOn) return;
-  if (video.currentTime !== lastVideoTime) {
+  if (now - lastInferenceRun >= camInferenceInterval && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
+    lastInferenceRun = now;
+    const started = performance.now();
     const res = landmarker.detectForVideo(video, now);
+    const elapsed = performance.now() - started;
+    camInferenceInterval = Math.max(CAM_MIN_INTERVAL_MS, elapsed * CAM_ADAPTIVE_HEADROOM);
     const t = now / 1000;
     if (res.landmarks && res.landmarks.length) {
       const c = classify(res.landmarks[0], camGesture);
@@ -292,11 +306,19 @@ async function toggleCamera() {
     if (!landmarker) {
       const mp = await import(`${MP_CDN}/vision_bundle.mjs`);
       const files = await mp.FilesetResolver.forVisionTasks(`${MP_CDN}/wasm`);
-      landmarker = await mp.HandLandmarker.createFromOptions(files, {
-        baseOptions: { modelAssetPath: "/api/hand_model" },
+      const opts = (delegate) => ({
+        baseOptions: { modelAssetPath: "/api/hand_model", delegate },
         numHands: 1, runningMode: "VIDEO",
         minHandDetectionConfidence: 0.6, minTrackingConfidence: 0.5,
       });
+      // Prefer the GPU delegate (runs off the main thread, frees it for
+      // drawing/network work); fall back to CPU when the device/driver can't
+      // provide it, so tracking still works rather than failing outright.
+      try {
+        landmarker = await mp.HandLandmarker.createFromOptions(files, opts("GPU"));
+      } catch (gpuErr) {
+        landmarker = await mp.HandLandmarker.createFromOptions(files, opts("CPU"));
+      }
     }
     camStream = await navigator.mediaDevices.getUserMedia({
       video: { width: 640, height: 480, facingMode: "user" },
