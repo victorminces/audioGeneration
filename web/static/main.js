@@ -1,6 +1,6 @@
 /* Gesture instrument — browser front end.
- * LEFT-drag/pinch + sing = demonstrate (audio + path go to the server)
- * RIGHT-drag/two fingers = play (all local: kernel map -> decoder -> synth)
+ * LEFT-drag / either hand closed  = demonstrate (audio + path go to the server)
+ * RIGHT-drag / both hands open    = play (kernel map -> decoder -> synth, local)
  *
  * The gesture space is D-dimensional. With the camera off it is the 2D pad
  * (mouse x, y). With the camera on it is the four full-body features below,
@@ -289,8 +289,8 @@ let landmarker = null;
 let poseLandmarker = null;
 let camOn = false;
 let camStream = null;
-let camPos = { x: 0.5, y: 0.5 };        // hand position, for the on-screen ring only
-let camGesture = null;          // raw (with hysteresis) gesture
+let camHands = [];              // [{x, y, closed, openness}] — for the overlay
+let camGesture = null;          // "record" | "play" | null (from the hand states)
 let camGestureT = 0;            // when it last changed
 let lastSeen = 0;               // last time a hand was detected
 let lastBodySeen = 0;           // last time the body was reliably measured
@@ -351,22 +351,37 @@ function bodyFeatures(lm) {
   return BODY_FEATURES.map((f, i) => norm01(raw[i], f.lo, f.hi));
 }
 
-// pinch enters at 0.35 / exits at 0.50; "two" relaxes once active (hysteresis,
-// same constants as camtrack.py) so landmark jitter doesn't flicker takes
-function classify(lm, prev) {
-  const p = (i) => lm[i];
+/* Open vs closed hand.
+ *
+ * Pinch needed the thumb and index tips resolved separately, which they are
+ * not once the whole body is in frame and the hand is a few dozen pixels
+ * across. This measures the grossest thing a hand does instead: how far the
+ * fingertips sit from the wrist, in palm lengths. A flat hand puts them about
+ * 2.2 palms out, a fist about 1.1, and that gap survives landmark noise at
+ * body distance.
+ *
+ * Hysteresis is keyed by handedness rather than detection order, so the two
+ * hands swapping places in the result list can't smear their states together. */
+const CLOSE_ENTER = 1.50;       // below this an open hand becomes closed
+const OPEN_EXIT   = 1.75;       // above this a closed hand opens again
+const closedState = { Left: false, Right: false };
+
+function handOpenness(lm) {
   const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-  const wrist = p(0);
-  const ext = (tip, pip, slack) => d(p(tip), wrist) > slack * d(p(pip), wrist);
-  const scale = d(p(9), wrist) + 1e-6;
-  if (d(p(4), p(8)) / scale < (prev === "pinch" ? 0.50 : 0.35)) {
-    return { g: "pinch", x: (p(4).x + p(8).x) / 2, y: (p(4).y + p(8).y) / 2 };
-  }
-  const two = prev === "two"
-    ? ext(8, 6, 1.02) && ext(12, 10, 1.02)
-    : ext(8, 6, 1.12) && ext(12, 10, 1.12) && !ext(16, 14, 1.12) && !ext(20, 18, 1.12);
-  if (two) return { g: "two", x: p(8).x, y: p(8).y };
-  return { g: null, x: p(8).x, y: p(8).y };
+  const wrist = lm[0];
+  const palm = d(wrist, lm[9]) + 1e-6;              // wrist -> middle knuckle
+  const tips = [8, 12, 16, 20];                     // index, middle, ring, pinky
+  let s = 0;
+  for (const t of tips) s += d(lm[t], wrist);
+  return s / tips.length / palm;
+}
+
+function classifyHand(lm, handed) {
+  const openness = handOpenness(lm);
+  const wasClosed = closedState[handed] || false;
+  const closed = wasClosed ? openness < OPEN_EXIT : openness < CLOSE_ENTER;
+  closedState[handed] = closed;
+  return { closed, openness, x: lm[9].x, y: lm[9].y };   // knuckle = steadier than a tip
 }
 
 function camFrame(now) {
@@ -392,23 +407,30 @@ function camFrame(now) {
     if (t - lastBodySeen > 0.5) { bodyVec = null; bodyMarks = null; }
 
     if (res.landmarks && res.landmarks.length) {
-      const c = classify(res.landmarks[0], camGesture);
-      // map through the same center square crop the preview is drawn with
       const vw = video.videoWidth, vh = video.videoHeight;
       const side = Math.min(vw, vh);
-      const cx = (c.x * vw - (vw - side) / 2) / side;
-      const cy = (c.y * vh - (vh - side) / 2) / side;
-      camPos = { x: Math.min(1, Math.max(0, 1 - cx)),    // mirror
+      camHands = res.landmarks.map((lm, i) => {
+        const handed = res.handedness?.[i]?.[0]?.categoryName === "Left" ? "Right" : "Left";
+        const c = classifyHand(lm, handed);
+        // map through the same center square crop the preview is drawn with
+        const cx = (c.x * vw - (vw - side) / 2) / side;
+        const cy = (c.y * vh - (vh - side) / 2) / side;
+        return { ...c, handed,
+                 x: Math.min(1, Math.max(0, 1 - cx)),     // mirror
                  y: Math.min(1, Math.max(0, cy)) };
-      if (c.g !== camGesture) { camGesture = c.g; camGestureT = t; }
+      });
+      // either hand closed -> record; hands up and all open -> play
+      const g = camHands.some((h) => h.closed) ? "record" : "play";
+      if (g !== camGesture) { camGesture = g; camGestureT = t; }
       lastSeen = t;
     } else if (t - lastSeen > 0.3 && camGesture !== null) {
       camGesture = null; camGestureT = t;                // ride through dropouts
+      camHands = [];
     }
 
     // camera may start takes when idle, but only ends takes it started
-    const want = camGesture === "pinch" ? "demo"
-               : camGesture === "two" ? "trace" : "idle";
+    const want = camGesture === "record" ? "demo"
+               : camGesture === "play" ? "trace" : "idle";
     const hold = want !== "idle" ? 0.12 : 0.35;          // quick engage, slow release
     // no body reading means no gesture point to record or play at
     if (want !== mode && t - camGestureT >= hold && (mode === "idle" || camDriving)
@@ -441,7 +463,7 @@ async function toggleCamera() {
       const files = await mp.FilesetResolver.forVisionTasks(`${MP_CDN}/wasm`);
       const opts = (delegate) => ({
         baseOptions: { modelAssetPath: "/api/hand_model", delegate },
-        numHands: 1, runningMode: "VIDEO",
+        numHands: 2, runningMode: "VIDEO",      // open/closed is read per hand
         minHandDetectionConfidence: 0.6, minTrackingConfidence: 0.5,
       });
       // Prefer the GPU delegate (runs off the main thread, frees it for
@@ -644,6 +666,67 @@ function drawFeatureBars() {
   ctx2d.restore();
 }
 
+/* Each hand as a filled disc when closed, a ring when open — the same
+ * distinction the gesture is made of, so you can see what the tracker thinks
+ * your hands are doing rather than guessing from the sound. */
+function drawHands() {
+  const w = canvas.width, h = canvas.height;
+  for (const hnd of camHands) {
+    const x = hnd.x * w, y = hnd.y * h;
+    ctx2d.lineWidth = 3;
+    ctx2d.strokeStyle = hnd.closed ? "#e65c5c" : "#5ac882";
+    ctx2d.beginPath();
+    ctx2d.arc(x, y, 16, 0, 2 * Math.PI);
+    ctx2d.stroke();
+    if (hnd.closed) {
+      ctx2d.fillStyle = "rgba(230,92,92,0.55)";
+      ctx2d.fill();
+    }
+    ctx2d.font = "10px ui-monospace, monospace";
+    ctx2d.textAlign = "center";
+    ctx2d.fillStyle = "rgba(220,220,235,0.85)";
+    ctx2d.fillText(hnd.closed ? "closed" : "open", x, y + 30);
+  }
+}
+
+/* Recording vs playing, unmissable: a full-canvas border in the mode colour
+ * plus a label. Recording also pulses, because that is the state you must not
+ * be in by accident. */
+function drawModeBanner() {
+  const w = canvas.width, h = canvas.height;
+  const rec = mode === "demo", play = mode === "trace";
+  if (!rec && !play) {
+    if (camHands.length === 0) {
+      ctx2d.save();
+      ctx2d.font = "13px ui-monospace, monospace";
+      ctx2d.textAlign = "center";
+      ctx2d.fillStyle = "rgba(190,190,210,0.7)";
+      ctx2d.fillText("show your hands — close one to record, open both to play",
+                     w / 2, h - 18);
+      ctx2d.restore();
+    }
+    return;
+  }
+  const pulse = rec ? 0.55 + 0.45 * Math.abs(Math.sin(performance.now() / 380)) : 1;
+  const color = rec ? "230,92,92" : "90,200,130";
+
+  ctx2d.save();
+  ctx2d.strokeStyle = `rgba(${color},${pulse})`;
+  ctx2d.lineWidth = 8;
+  ctx2d.strokeRect(4, 4, w - 8, h - 8);
+
+  const label = rec ? "● RECORDING — keep singing" : "▶ PLAYING";
+  ctx2d.font = "bold 20px ui-monospace, monospace";
+  ctx2d.textAlign = "center";
+  ctx2d.textBaseline = "middle";
+  const tw = ctx2d.measureText(label).width;
+  ctx2d.fillStyle = `rgba(${color},${0.85 * pulse})`;
+  ctx2d.fillRect(w / 2 - tw / 2 - 14, h - 54, tw + 28, 32);
+  ctx2d.fillStyle = "#0b0b14";
+  ctx2d.fillText(label, w / 2, h - 38);
+  ctx2d.restore();
+}
+
 function draw() {
   const w = canvas.width, h = canvas.height;
   ctx2d.fillStyle = "#0b0b14";
@@ -673,15 +756,9 @@ function draw() {
     drawBodyMarks();
   }
 
-  if (camOn) {                                 // hand ring: which gesture is armed
-    ctx2d.strokeStyle = colors[camGesture === "pinch" ? "demo"
-                             : camGesture === "two" ? "trace" : "idle"];
-    ctx2d.lineWidth = 2;
-    ctx2d.beginPath();
-    ctx2d.arc(camPos.x * w, camPos.y * h, 12, 0, 2 * Math.PI);
-    ctx2d.stroke();
-  }
+  if (camOn) drawHands();
   drawFeatureBars();
+  if (camOn) drawModeBanner();
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);
