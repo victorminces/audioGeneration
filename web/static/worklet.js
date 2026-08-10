@@ -1,7 +1,8 @@
 /* Gesture instrument worklet: RBF map -> DDSP decoder -> harmonic+noise synth.
  *
  * Everything real-time happens here, at the audio rate, with no network:
- *  - RBF ridge map: (x, y) -> [log f0, loudness, z16]   (W from the server)
+ *  - kernel map: gesture point in [0,1]^D -> [log f0, loudness, z16]  (samples
+ *    from the server; D is 2 for the mouse pad, 4 for the full-body features)
  *  - decoder: MLP -> GRU -> MLP -> heads (amp, 60 harmonic weights, 65 noise
  *    band gains), a faithful port of ddsp.py's StreamingSynth
  *  - synth: phase-accumulated oscillator bank + FFT-filtered noise (OLA)
@@ -15,6 +16,7 @@
  */
 
 const MODEL_SR = 16000;
+const MAX_DIM = 8;                 // gesture-space capacity; 2 (pad) and 4 (body) today
 
 class Instrument extends AudioWorkletProcessor {
   constructor(options) {
@@ -33,15 +35,17 @@ class Instrument extends AudioWorkletProcessor {
     this._initFFT(this.noiseFFT);
 
     // mapper (empty until the server sends one)
-    this.pts = null;                         // Float32Array, rows [x, y, ux, uy, 18 targets]
+    this.pts = null;                         // Float32Array, rows [p_1..p_D, u_1..u_D, 18 targets]
     this.nPts = 0;
+    this.dim = 2;                            // D of the gesture space (2 = pad, 4 = body)
     this.nOut = 2 + this.C.Z_DIM;
     this.sigma = 0.15;                       // across-stroke width
     this.sigmaPar = 0.04;                    // along-stroke width (aniso mode)
     this.fade = 0.0;                         // confidence gain (silence off-data)
 
-    // control state (written by messages, read by the render loop)
-    this.x = 0.5; this.y = 0.5;
+    // control state (written by messages, read by the render loop). Fixed
+    // capacity so nothing allocates on the audio thread when D changes.
+    this.pos = new Float32Array(MAX_DIM).fill(0.5);
     this.gate = 0.0;
     this.gain = 0.0;
 
@@ -73,22 +77,24 @@ class Instrument extends AudioWorkletProcessor {
     if (m.type === "map") {
       this.sigma = m.sigma;
       this.sigmaPar = m.sigmaPar;
+      const D = Math.min(m.dim || 2, MAX_DIM);
+      this.dim = D;
       if (m.points && m.points.length) {
-        const stride = 4 + this.nOut;
+        const stride = 2 * D + this.nOut;
         this.nPts = m.points.length;
         this.pts = new Float32Array(this.nPts * stride);
         for (let i = 0; i < this.nPts; i++)
           for (let j = 0; j < stride; j++)
             this.pts[i * stride + j] = m.points[i][j];
         if (m.mode !== "aniso")                 // round kernel: drop the tangents
-          for (let i = 0; i < this.nPts; i++) {
-            this.pts[i * stride + 2] = 0; this.pts[i * stride + 3] = 0;
-          }
+          for (let i = 0; i < this.nPts; i++)
+            for (let j = 0; j < D; j++) this.pts[i * stride + D + j] = 0;
       } else {
         this.pts = null; this.nPts = 0;
       }
     } else if (m.type === "pos") {
-      this.x = m.x; this.y = m.y;
+      const p = m.p;                            // array of D coordinates
+      for (let j = 0; j < this.dim && j < p.length; j++) this.pos[j] = p[j];
     } else if (m.type === "gate") {
       this.gate = m.on ? 1.0 : 0.0;
     } else if (m.type === "record") {
@@ -115,18 +121,25 @@ class Instrument extends AudioWorkletProcessor {
   predict(out) {
     const sx2 = 2 * this.sigma * this.sigma;
     const sp2 = 2 * this.sigmaPar * this.sigmaPar;
-    const stride = 4 + this.nOut, P = this.pts;
+    const D = this.dim, stride = 2 * D + this.nOut, P = this.pts, q = this.pos;
     out.fill(0);
     let sw = 0, wmax = 0;
     for (let i = 0; i < this.nPts; i++) {
       const o = i * stride;
-      const dx = this.x - P[o], dy = this.y - P[o + 1];
-      const along = dx * P[o + 2] + dy * P[o + 3];
-      const across2 = Math.max(dx * dx + dy * dy - along * along, 0);
+      // squared distance and the component along this sample's tangent, both
+      // accumulated over D dims (the 2D case is just D = 2 of this loop)
+      let d2 = 0, along = 0;
+      for (let j = 0; j < D; j++) {
+        const dj = q[j] - P[o + j];
+        d2 += dj * dj;
+        along += dj * P[o + D + j];
+      }
+      const across2 = Math.max(d2 - along * along, 0);
       const w = Math.exp(-along * along / sp2 - across2 / sx2);
       sw += w;
       if (w > wmax) wmax = w;
-      for (let j = 0; j < this.nOut; j++) out[j] += w * P[o + 4 + j];
+      const base = o + 2 * D;
+      for (let j = 0; j < this.nOut; j++) out[j] += w * P[base + j];
     }
     const inv = 1 / (sw + 1e-12);
     for (let j = 0; j < this.nOut; j++) out[j] *= inv;

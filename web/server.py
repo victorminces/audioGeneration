@@ -60,10 +60,11 @@ app = FastAPI()
 
 def state_json():
     return {
-        # one row per thinned sample: [x, y, ux, uy, log_f0, loud, z_1..z_16]
-        # (ux, uy) = unit tangent of the stroke there; (0, 0) = no direction
+        # one row per thinned sample: [p_1..p_D, u_1..u_D, log_f0, loud, z_1..z_16]
+        # u = unit tangent of the stroke there; all-zero = no clear direction
         "points": (np.concatenate([MAPPER.S, MAPPER.U, MAPPER.T], axis=1).tolist()
                    if MAPPER.ready else None),
+        "dim": MAPPER.dim,          # D of the gesture space; the worklet strides by it
         "mode": MAPPER.mode,
         "sigma": MAPPER.sigma,
         "sigma_par": MAPPER.sigma_par,
@@ -96,7 +97,8 @@ def get_state():
 
 @app.post("/api/take")
 async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(...)):
-    """audio: raw little-endian float32 mono; cursor: JSON [[t,x,y],...]."""
+    """audio: raw little-endian float32 mono; cursor: JSON [[t, p_1..p_D],...]
+    (D=2 for the mouse pad, D=4 for the full-body features)."""
     raw = await audio.read()
     wav = np.frombuffer(raw, dtype=np.float32).copy()
     cur = np.array(json.loads(cursor), dtype=np.float64)
@@ -115,11 +117,13 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
                               p["z"].numpy()], axis=1)
     t = (np.arange(n_frames) + 0.5) * ddsp.HOP / ddsp.SR
     t = t[t <= cur[-1, 0]]                      # audio may outlast cursor
-    xy = np.stack([np.interp(t, cur[:, 0], cur[:, 1]),
-                   np.interp(t, cur[:, 0], cur[:, 2])], axis=1)
+    # resample every gesture dimension onto the analysis frame times
+    dim = cur.shape[1] - 1                      # column 0 is the timestamp
+    pts = np.stack([np.interp(t, cur[:, 0], cur[:, j + 1]) for j in range(dim)],
+                   axis=1)
     with LOCK:
-        MAPPER.add(xy, targets[:len(t)], seconds=len(wav) / ddsp.SR)
-        return {"ok": True, "path": xy.tolist(), **state_json()}
+        MAPPER.add(pts, targets[:len(t)], seconds=len(wav) / ddsp.SR)
+        return {"ok": True, "path": pts.tolist(), **state_json()}
 
 
 @app.post("/api/config")
@@ -129,17 +133,22 @@ def post_config(mode: str = Form(None), sigma: float = Form(None),
         if mode in ("iso", "aniso"):
             MAPPER.mode = mode
         if sigma is not None:
-            MAPPER.sigma = float(np.clip(sigma, 0.03, 0.6))
+            # ceiling is generous: in 4D points sit further apart than on the
+            # 2D pad, so a usable across-width there runs well past the old 0.6
+            MAPPER.sigma = float(np.clip(sigma, 0.03, 1.2))
         if sigma_par is not None:
             MAPPER.sigma_par = float(np.clip(sigma_par, 0.01, 0.3))
         return state_json()
 
 
 @app.post("/api/clear")
-def post_clear():
+def post_clear(dim: int = Form(None)):
     global MAPPER
     with LOCK:
-        MAPPER = KernelMapper()
+        # the caller passes the width it is about to send points in (the front
+        # end switches spaces when the camera goes on/off); without it, keep
+        # the current one so a plain clear doesn't silently change the space
+        MAPPER = KernelMapper(dim=int(dim) if dim is not None else MAPPER.dim)
         return state_json()
 
 
