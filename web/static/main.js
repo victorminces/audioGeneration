@@ -28,14 +28,19 @@ const PAD_FEATURES = [
   { key: "x", label: "pad x", lo: 0, hi: 1, color: "#9aa0c0" },
   { key: "y", label: "pad y", lo: 0, hi: 1, color: "#9aa0c0" },
 ];
+// The two modalities. Each keeps its own map on the server and its own drawn
+// paths here, so switching back and forth never destroys the other's work.
+const SPACE_FEATURES = { xy: PAD_FEATURES, body: BODY_FEATURES };
+let space = "xy";               // "xy" | "body"
 let features = PAD_FEATURES;    // whichever space is currently driving the map
 const GDIM = () => features.length;
+const demoPathsBy = { xy: [], body: [] };
 
 let node = null;                // AudioWorkletNode
 let audioCtx = null;
 let state = { seconds: 0, model: "…", mode: "aniso", sigma: 0.15, sigma_par: 0.04,
               points: null, dim: 2 };
-let demoPaths = [];             // [[p_1..p_D],...] per finished take
+let demoPaths = demoPathsBy.xy; // [[p_1..p_D],...] per finished take, current space
 let mode = "idle";              // idle | demo | trace
 let cursor = [];                // [t, p_1..p_D] during a take
 let takeT0 = 0;
@@ -50,6 +55,16 @@ function hud() {
     `model ${state.model}  ·  map ${state.seconds.toFixed(1)}s  ·  ` +
     (audioCtx ? `${audioCtx.sampleRate} Hz` : "audio off");
 }
+
+// ── modality toggle ─────────────────────────────────────────────────────────
+const spaceBtn = document.getElementById("space");
+const legendEl = document.getElementById("legend");
+const LEGENDS = {
+  xy: '<i class="r">left-drag / pinch</i> sing to teach &nbsp; '
+    + '<i class="g">right-drag / two fingers</i> play',
+  body: '<i class="r">cross forearms 3s</i> record &nbsp; '
+      + '<i class="r">again</i> play &nbsp; <i class="g">hold 6s</i> stop',
+};
 
 // ── kernel controls ─────────────────────────────────────────────────────────
 const modeEl = document.getElementById("mode");
@@ -67,32 +82,42 @@ function syncControls() {
   document.getElementById("sigpRow").style.opacity = aniso ? 1 : 0.35;
 }
 
-async function clearMap(dim) {
+async function clearMap() {
   const fd = new FormData();
-  fd.append("dim", String(dim === undefined ? GDIM() : dim));
+  fd.append("space", space);
   state = await fetch("/api/clear", { method: "POST", body: fd }).then(r => r.json());
-  demoPaths = [];
+  demoPaths.length = 0;
   if (node) sendMap();
   hud();
 }
 
-/* Switch which set of features is the gesture space. The demonstrations
- * already in the map were recorded as points in the old space and have no
- * meaning in the new one (a 2-D pad point is not a 4-D body pose), so the map
- * is cleared rather than reinterpreted. */
+/* Switch modality. Each space has its own mapper on the server, so this only
+ * has to fetch the other one's state and swap the drawn paths — nothing is
+ * cleared, and whatever you demonstrated in the space you're leaving is still
+ * there when you come back. */
 async function setSpace(next) {
-  if (features === next) return;
-  features = next;
-  const D = GDIM();
-  const p = new Array(D).fill(0.5);             // new dims start centred
-  for (let i = 0; i < Math.min(pos.length, D); i++) p[i] = pos[i];
-  pos = p;
-  if (state.dim !== D) {
-    await clearMap(D);
-    setStatus(`gesture space is now ${features.map(f => f.label).join(" · ")}`
-              + " — previous demonstrations cleared");
-  }
+  if (space === next) return;
+  if (mode !== "idle") endTake();
+  space = next;
+  features = SPACE_FEATURES[space];
+  demoPaths = demoPathsBy[space];
+  pos = new Array(GDIM()).fill(0.5);
+  crossSince = 0; crossArmed = null;
+  state = await fetch(`/api/state?space=${space}`).then(r => r.json());
+  if (node) sendMap();
+  syncControls();
+  hud();
+  setStatus(space === "body"
+    ? "whole body — cross your forearms 3s to start recording"
+    : "x,y — hold LEFT + sing to demonstrate · hold RIGHT to play");
+  spaceBtn.textContent = space === "body" ? "mode: whole body" : "mode: x,y";
+  legendEl.innerHTML = LEGENDS[space];
 }
+
+spaceBtn.addEventListener("click", async () => {
+  await setSpace(space === "xy" ? "body" : "xy");
+  if (space === "body" && !camOn) setStatus("whole body needs the camera — turn it on");
+});
 
 let configBusy = false;
 async function postConfig(fields) {
@@ -100,6 +125,7 @@ async function postConfig(fields) {
   configBusy = true;
   const fd = new FormData();
   for (const [k, v] of Object.entries(fields)) fd.append(k, String(v));
+  fd.append("space", space);
   try {
     state = await fetch("/api/config", { method: "POST", body: fd }).then(r => r.json());
     sendMap();
@@ -123,13 +149,9 @@ async function boot() {
   const [manifest, weightsBuf, st] = await Promise.all([
     fetch("/api/decoder/manifest").then(r => r.json()),
     fetch("/api/decoder/weights").then(r => r.arrayBuffer()),
-    fetch("/api/state").then(r => r.json()),
+    fetch(`/api/state?space=${space}`).then(r => r.json()),
   ]);
   state = st;
-  // Adopt whatever space the server's map is already in. Without this a reload
-  // (or a fresh tab against a running server) would sit in 2-D pad mode while
-  // the map holds 4-D body samples, and the points sent would not line up.
-  features = state.dim === BODY_FEATURES.length ? BODY_FEATURES : PAD_FEATURES;
   pos = new Array(GDIM()).fill(0.5);
 
   audioCtx = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
@@ -181,6 +203,7 @@ async function uploadTake(audio) {
   fd.append("audio", new Blob([audio.buffer], { type: "application/octet-stream" }));
   fd.append("cursor", JSON.stringify(cur));
   fd.append("sr", String(audioCtx.sampleRate));
+  fd.append("space", space);
   try {
     const r = await fetch("/api/take", { method: "POST", body: fd }).then(r => r.json());
     if (r.ok) {
@@ -236,6 +259,15 @@ function startTake(kind, byCam) {
 
 function endTake() {
   if (mode === "demo") {
+    // A take is stopped by crossing, which takes 3s — so the tail of the
+    // cursor is the cross itself, not playing. Drop everything from the moment
+    // the cross began; the server clips the audio to the cursor's last
+    // timestamp, so the sung tail goes with it.
+    if (crossSince) {
+      const cutoff = crossSince - takeT0 / 1000;
+      const kept = cursor.filter((row) => row[0] <= cutoff);
+      if (kept.length >= 6) cursor = kept;
+    }
     pendingCursor = cursor;
     node.port.postMessage({ type: "record", on: false });   // worklet posts audio back
     livePath = [];
@@ -289,8 +321,8 @@ let landmarker = null;
 let poseLandmarker = null;
 let camOn = false;
 let camStream = null;
-let camHands = [];              // [{x, y, closed, openness}] — for the overlay
-let camGesture = null;          // "record" | "play" | null (from the hand states)
+let camPos = { x: 0.5, y: 0.5 };  // tracked hand position (x,y mode)
+let camGesture = null;          // "pinch" | "two" | null, with hysteresis
 let camGestureT = 0;            // when it last changed
 let lastSeen = 0;               // last time a hand was detected
 let lastBodySeen = 0;           // last time the body was reliably measured
@@ -351,37 +383,57 @@ function bodyFeatures(lm) {
   return BODY_FEATURES.map((f, i) => norm01(raw[i], f.lo, f.hi));
 }
 
-/* Open vs closed hand.
- *
- * Pinch needed the thumb and index tips resolved separately, which they are
- * not once the whole body is in frame and the hand is a few dozen pixels
- * across. This measures the grossest thing a hand does instead: how far the
- * fingertips sit from the wrist, in palm lengths. A flat hand puts them about
- * 2.2 palms out, a fist about 1.1, and that gap survives landmark noise at
- * body distance.
- *
- * Hysteresis is keyed by handedness rather than detection order, so the two
- * hands swapping places in the result list can't smear their states together. */
-const CLOSE_ENTER = 1.50;       // below this an open hand becomes closed
-const OPEN_EXIT   = 1.75;       // above this a closed hand opens again
-const closedState = { Left: false, Right: false };
-
-function handOpenness(lm) {
+// ── x,y mode gestures: pinch / two fingers ──────────────────────────────────
+// pinch enters at 0.35 / exits at 0.50; "two" relaxes once active (hysteresis,
+// same constants as camtrack.py) so landmark jitter doesn't flicker takes
+function classify(lm, prev) {
+  const p = (i) => lm[i];
   const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-  const wrist = lm[0];
-  const palm = d(wrist, lm[9]) + 1e-6;              // wrist -> middle knuckle
-  const tips = [8, 12, 16, 20];                     // index, middle, ring, pinky
-  let s = 0;
-  for (const t of tips) s += d(lm[t], wrist);
-  return s / tips.length / palm;
+  const wrist = p(0);
+  const ext = (tip, pip, slack) => d(p(tip), wrist) > slack * d(p(pip), wrist);
+  const scale = d(p(9), wrist) + 1e-6;
+  if (d(p(4), p(8)) / scale < (prev === "pinch" ? 0.50 : 0.35)) {
+    return { g: "pinch", x: (p(4).x + p(8).x) / 2, y: (p(4).y + p(8).y) / 2 };
+  }
+  const two = prev === "two"
+    ? ext(8, 6, 1.02) && ext(12, 10, 1.02)
+    : ext(8, 6, 1.12) && ext(12, 10, 1.12) && !ext(16, 14, 1.12) && !ext(20, 18, 1.12);
+  if (two) return { g: "two", x: p(8).x, y: p(8).y };
+  return { g: null, x: p(8).x, y: p(8).y };
 }
 
-function classifyHand(lm, handed) {
-  const openness = handOpenness(lm);
-  const wasClosed = closedState[handed] || false;
-  const closed = wasClosed ? openness < OPEN_EXIT : openness < CLOSE_ENTER;
-  closedState[handed] = closed;
-  return { closed, openness, x: lm[9].x, y: lm[9].y };   // knuckle = steadier than a tip
+// ── body mode gesture: crossed forearms ─────────────────────────────────────
+/* The whole gesture is "do the forearms physically cross", tested as a segment
+ * intersection between elbow->wrist on each side. That is a property of the
+ * geometry itself, so it needs no thresholds and is already invariant to
+ * scale, position and which way you face — unlike the finger poses, which
+ * stopped being resolvable once the whole body is in frame.
+ *
+ * Timing (all measured on a continuously-held cross, and acted on when you
+ * uncross, so the cross pose itself never lands in a recording):
+ *   held >= 3s, then release -> toggle record <-> play
+ *   held >= 6s, then release -> stop everything
+ *   released before 3s       -> nothing happened                            */
+const CROSS_TOGGLE_S = 3.0;
+const CROSS_STOP_S   = 6.0;
+const CROSS_GAP_S    = 0.25;    // tracking dropout tolerated without resetting
+let crossSince = 0;             // when the current continuous cross began
+let crossLastSeen = 0;
+let crossArmed = null;          // "toggle" | "stop" — what release will do
+
+function segmentsCross(a1, a2, b1, b2) {
+  const side = (p, q, r) => (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+  const d1 = side(b1, b2, a1), d2 = side(b1, b2, a2);
+  const d3 = side(a1, a2, b1), d4 = side(a1, a2, b2);
+  return ((d1 > 0) !== (d2 > 0)) && ((d3 > 0) !== (d4 > 0));
+}
+
+function forearmsCrossed(lm) {
+  const need = [PL.LEL, PL.REL, PL.LWR, PL.RWR];
+  for (const i of need)
+    if (!lm[i] || (lm[i].visibility !== undefined && lm[i].visibility < MIN_VIS))
+      return false;
+  return segmentsCross(lm[PL.LEL], lm[PL.LWR], lm[PL.REL], lm[PL.RWR]);
 }
 
 function camFrame(now) {
@@ -389,59 +441,93 @@ function camFrame(now) {
   if (now - lastInferenceRun >= camInferenceInterval && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
     lastInferenceRun = now;
+    // only the model this modality needs runs — halves the per-frame cost
     const started = performance.now();
-    const res = landmarker.detectForVideo(video, now);
-    const pres = poseLandmarker ? poseLandmarker.detectForVideo(video, now) : null;
+    const res = space === "xy" ? landmarker.detectForVideo(video, now) : null;
+    const pres = space === "body" && poseLandmarker
+               ? poseLandmarker.detectForVideo(video, now) : null;
     const elapsed = performance.now() - started;
-    // both models are inside the measurement, so the backoff accounts for the
-    // real per-frame cost of running them together
     camInferenceInterval = Math.max(CAM_MIN_INTERVAL_MS, elapsed * CAM_ADAPTIVE_HEADROOM);
     const t = now / 1000;
 
-    // body -> gesture point. Held at its last value while the body is out of
-    // view, so a momentary tracking dropout doesn't jump the sound.
-    if (pres && pres.landmarks && pres.landmarks.length) {
-      const f = bodyFeatures(pres.landmarks[0]);
-      if (f) { bodyVec = f; lastBodySeen = t; }
-    }
-    if (t - lastBodySeen > 0.5) { bodyVec = null; bodyMarks = null; }
-
-    if (res.landmarks && res.landmarks.length) {
-      const vw = video.videoWidth, vh = video.videoHeight;
-      const side = Math.min(vw, vh);
-      camHands = res.landmarks.map((lm, i) => {
-        const handed = res.handedness?.[i]?.[0]?.categoryName === "Left" ? "Right" : "Left";
-        const c = classifyHand(lm, handed);
-        // map through the same center square crop the preview is drawn with
-        const cx = (c.x * vw - (vw - side) / 2) / side;
-        const cy = (c.y * vh - (vh - side) / 2) / side;
-        return { ...c, handed,
-                 x: Math.min(1, Math.max(0, 1 - cx)),     // mirror
-                 y: Math.min(1, Math.max(0, cy)) };
-      });
-      // either hand closed -> record; hands up and all open -> play
-      const g = camHands.some((h) => h.closed) ? "record" : "play";
-      if (g !== camGesture) { camGesture = g; camGestureT = t; }
-      lastSeen = t;
-    } else if (t - lastSeen > 0.3 && camGesture !== null) {
-      camGesture = null; camGestureT = t;                // ride through dropouts
-      camHands = [];
-    }
-
-    // camera may start takes when idle, but only ends takes it started
-    const want = camGesture === "record" ? "demo"
-               : camGesture === "play" ? "trace" : "idle";
-    const hold = want !== "idle" ? 0.12 : 0.35;          // quick engage, slow release
-    // no body reading means no gesture point to record or play at
-    if (want !== mode && t - camGestureT >= hold && (mode === "idle" || camDriving)
-        && (want === "idle" || bodyVec)) {
-      if (mode !== "idle") endTake();
-      if (want !== "idle") { pos = bodyVec.slice(); startTake(want, true); }
-    }
-    if (camGesture !== null && bodyVec && (mode === "idle" || camDriving))
-      moveTo(bodyVec.slice());
+    if (space === "xy") frameXY(res, t);
+    else frameBody(pres, t);
   }
   requestAnimationFrame(camFrame);
+}
+
+// x,y: hand position drives the point, pinch/two-fingers drive the takes
+function frameXY(res, t) {
+  if (res && res.landmarks && res.landmarks.length) {
+    const c = classify(res.landmarks[0], camGesture);
+    // map through the same center square crop the preview is drawn with
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const side = Math.min(vw, vh);
+    const cx = (c.x * vw - (vw - side) / 2) / side;
+    const cy = (c.y * vh - (vh - side) / 2) / side;
+    camPos = { x: Math.min(1, Math.max(0, 1 - cx)),      // mirror
+               y: Math.min(1, Math.max(0, cy)) };
+    if (c.g !== camGesture) { camGesture = c.g; camGestureT = t; }
+    lastSeen = t;
+  } else if (t - lastSeen > 0.3 && camGesture !== null) {
+    camGesture = null; camGestureT = t;                  // ride through dropouts
+  }
+
+  // camera may start takes when idle, but only ends takes it started
+  const want = camGesture === "pinch" ? "demo"
+             : camGesture === "two" ? "trace" : "idle";
+  const hold = want !== "idle" ? 0.12 : 0.35;            // quick engage, slow release
+  if (want !== mode && t - camGestureT >= hold && (mode === "idle" || camDriving)) {
+    if (mode !== "idle") endTake();
+    if (want !== "idle") { pos = [camPos.x, camPos.y]; startTake(want, true); }
+  }
+  if (camGesture !== null && (mode === "idle" || camDriving))
+    moveTo([camPos.x, camPos.y]);
+}
+
+// body: the four features drive the point, crossed forearms drive the takes
+function frameBody(pres, t) {
+  const lm = pres && pres.landmarks && pres.landmarks.length ? pres.landmarks[0] : null;
+
+  // gesture point, held at its last value through a brief tracking dropout so
+  // the sound doesn't jump
+  if (lm) {
+    const f = bodyFeatures(lm);
+    if (f) { bodyVec = f; lastBodySeen = t; }
+  }
+  if (t - lastBodySeen > 0.5) { bodyVec = null; bodyMarks = null; }
+
+  const crossed = lm ? forearmsCrossed(lm) : false;
+  if (crossed) {
+    if (!crossSince) crossSince = t;
+    crossLastSeen = t;
+    const held = t - crossSince;
+    crossArmed = held >= CROSS_STOP_S ? "stop"
+               : held >= CROSS_TOGGLE_S ? "toggle" : null;
+  } else if (crossSince && t - crossLastSeen > CROSS_GAP_S) {
+    applyCross(crossArmed);                    // acts on release, not on the hold
+    crossSince = 0; crossArmed = null;
+  }
+
+  // while crossed, the arms are making a gesture rather than playing, so the
+  // point is frozen — otherwise crossing would smear across the whole map
+  if (bodyVec && !crossSince && (mode === "idle" || camDriving))
+    moveTo(bodyVec.slice());
+}
+
+function applyCross(action) {
+  if (!action) return;
+  if (action === "stop") {
+    if (mode !== "idle") endTake();
+    setStatus("stopped — cross again for 3s to record");
+    return;
+  }
+  // toggle: idle -> record, record -> play, play -> record
+  const next = mode === "demo" ? "trace" : "demo";
+  if (mode !== "idle") endTake();
+  if (!bodyVec) { setStatus("step into frame — body not visible"); return; }
+  pos = bodyVec.slice();
+  startTake(next, true);
 }
 
 async function toggleCamera() {
@@ -452,7 +538,7 @@ async function toggleCamera() {
     video.srcObject = null;
     camGesture = null;
     bodyVec = bodyMarks = null;
-    await setSpace(PAD_FEATURES);
+    crossSince = 0; crossArmed = null;
     camBtn.textContent = "camera: off";
     return;
   }
@@ -495,7 +581,6 @@ async function toggleCamera() {
     video.srcObject = camStream;
     await video.play();
     camOn = true;
-    await setSpace(BODY_FEATURES);
     camBtn.textContent = "camera: on";
     requestAnimationFrame(camFrame);
   } catch (err) {
@@ -635,9 +720,13 @@ function drawFeatureBars() {
   ctx2d.save();
   ctx2d.font = "11px ui-monospace, monospace";
   ctx2d.textBaseline = "middle";
+  // the preview underneath is at full brightness now, so the panel needs its
+  // own backing or the bars vanish against a light shirt
+  ctx2d.fillStyle = "rgba(8,8,16,0.62)";
+  ctx2d.fillRect(pad - 8, pad - 6, bw + 100, features.length * gap + 10);
   features.forEach((f, j) => {
     const y = pad + 6 + j * gap;
-    ctx2d.fillStyle = "rgba(200,200,220,0.75)";
+    ctx2d.fillStyle = "rgba(225,225,240,0.9)";
     ctx2d.textAlign = "left";
     ctx2d.fillText(f.label, pad, y);
     const x0 = pad + 46;
@@ -666,27 +755,42 @@ function drawFeatureBars() {
   ctx2d.restore();
 }
 
-/* Each hand as a filled disc when closed, a ring when open — the same
- * distinction the gesture is made of, so you can see what the tracker thinks
- * your hands are doing rather than guessing from the sound. */
-function drawHands() {
+/* The cross hold, as a ring that fills. Filling toward 3s means "release now
+ * to switch"; past 3s it turns amber and starts refilling toward the 6s stop,
+ * so both thresholds are visible while you hold rather than guessed at. */
+function drawCrossProgress() {
+  if (!crossSince) return;
+  const held = performance.now() / 1000 - crossSince;
   const w = canvas.width, h = canvas.height;
-  for (const hnd of camHands) {
-    const x = hnd.x * w, y = hnd.y * h;
-    ctx2d.lineWidth = 3;
-    ctx2d.strokeStyle = hnd.closed ? "#e65c5c" : "#5ac882";
-    ctx2d.beginPath();
-    ctx2d.arc(x, y, 16, 0, 2 * Math.PI);
-    ctx2d.stroke();
-    if (hnd.closed) {
-      ctx2d.fillStyle = "rgba(230,92,92,0.55)";
-      ctx2d.fill();
-    }
-    ctx2d.font = "10px ui-monospace, monospace";
-    ctx2d.textAlign = "center";
-    ctx2d.fillStyle = "rgba(220,220,235,0.85)";
-    ctx2d.fillText(hnd.closed ? "closed" : "open", x, y + 30);
-  }
+  const cx = w / 2, cy = h / 2, r = 54;
+  const toStop = held >= CROSS_TOGGLE_S;
+  const frac = toStop
+    ? Math.min(1, (held - CROSS_TOGGLE_S) / (CROSS_STOP_S - CROSS_TOGGLE_S))
+    : held / CROSS_TOGGLE_S;
+  const color = toStop ? "#e0a54a" : "#5ac8e0";
+
+  ctx2d.save();
+  ctx2d.lineWidth = 9;
+  ctx2d.strokeStyle = "rgba(0,0,0,0.45)";
+  ctx2d.beginPath(); ctx2d.arc(cx, cy, r, 0, 2 * Math.PI); ctx2d.stroke();
+  ctx2d.strokeStyle = color;
+  ctx2d.lineCap = "round";
+  ctx2d.beginPath();
+  ctx2d.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + frac * 2 * Math.PI);
+  ctx2d.stroke();
+
+  const next = mode === "demo" ? "play" : "record";
+  const label = toStop ? "keep holding → stop" : `release → ${next}`;
+  ctx2d.font = "bold 13px ui-monospace, monospace";
+  ctx2d.textAlign = "center";
+  ctx2d.textBaseline = "middle";
+  ctx2d.lineWidth = 4;
+  ctx2d.strokeStyle = "rgba(0,0,0,0.75)";
+  ctx2d.strokeText(label, cx, cy + r + 22);
+  ctx2d.fillStyle = "#fff";
+  ctx2d.fillText(label, cx, cy + r + 22);
+  ctx2d.fillText(held.toFixed(1) + "s", cx, cy);
+  ctx2d.restore();
 }
 
 /* Recording vs playing, unmissable: a full-canvas border in the mode colour
@@ -696,13 +800,16 @@ function drawModeBanner() {
   const w = canvas.width, h = canvas.height;
   const rec = mode === "demo", play = mode === "trace";
   if (!rec && !play) {
-    if (camHands.length === 0) {
+    if (space === "body" && !crossSince) {
       ctx2d.save();
-      ctx2d.font = "13px ui-monospace, monospace";
+      ctx2d.font = "bold 13px ui-monospace, monospace";
       ctx2d.textAlign = "center";
-      ctx2d.fillStyle = "rgba(190,190,210,0.7)";
-      ctx2d.fillText("show your hands — close one to record, open both to play",
-                     w / 2, h - 18);
+      ctx2d.lineWidth = 4;
+      ctx2d.strokeStyle = "rgba(0,0,0,0.75)";
+      const msg = "cross your forearms for 3s to start recording";
+      ctx2d.strokeText(msg, w / 2, h - 18);
+      ctx2d.fillStyle = "rgba(225,225,240,0.95)";
+      ctx2d.fillText(msg, w / 2, h - 18);
       ctx2d.restore();
     }
     return;
@@ -731,11 +838,10 @@ function draw() {
   const w = canvas.width, h = canvas.height;
   ctx2d.fillStyle = "#0b0b14";
   ctx2d.fillRect(0, 0, w, h);
-  if (camOn && video.readyState >= 2) {        // dimmed, mirrored preview
+  if (camOn && video.readyState >= 2) {        // full-brightness mirrored preview
     const vw = video.videoWidth, vh = video.videoHeight;
     const side = Math.min(vw, vh);             // center square crop: no stretch
     ctx2d.save();
-    ctx2d.globalAlpha = 0.25;
     ctx2d.scale(-1, 1);
     ctx2d.drawImage(video, (vw - side) / 2, (vh - side) / 2, side, side,
                     -w, 0, w, h);
@@ -745,9 +851,17 @@ function draw() {
 
   // a path through 4-D body space isn't a curve on this canvas, so the drawn
   // trace only means something in the 2-D pad space; the bars carry the rest
-  if (GDIM() === 2) {
+  if (space === "xy") {
     for (const p of demoPaths) drawPath(decimate(p), "rgba(130,190,130,0.9)", 2);
     if (mode === "demo") drawPath(decimate(livePath), "#dc5a5a", 2);
+    if (camOn) {                               // tracked hand, and which gesture
+      ctx2d.strokeStyle = colors[camGesture === "pinch" ? "demo"
+                               : camGesture === "two" ? "trace" : "idle"];
+      ctx2d.lineWidth = 2;
+      ctx2d.beginPath();
+      ctx2d.arc(camPos.x * w, camPos.y * h, 12, 0, 2 * Math.PI);
+      ctx2d.stroke();
+    }
     ctx2d.fillStyle = colors[mode];
     ctx2d.beginPath();
     ctx2d.arc(pos[0] * w, pos[1] * h, mode === "idle" ? 4 : 7, 0, 2 * Math.PI);
@@ -756,9 +870,11 @@ function draw() {
     drawBodyMarks();
   }
 
-  if (camOn) drawHands();
   drawFeatureBars();
-  if (camOn) drawModeBanner();
+  if (camOn) {
+    drawModeBanner();
+    if (space === "body") drawCrossProgress();
+  }
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);

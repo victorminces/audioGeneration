@@ -33,8 +33,17 @@ print("loading DDSP model…", flush=True)
 MODEL, MODEL_NAME = load_latest_ddsp(PROJ)
 print(f"model: {MODEL_NAME}", flush=True)
 
-MAPPER = KernelMapper()
+# One mapper per modality, kept side by side: a pad point and a body pose are
+# different kinds of thing, so their demonstrations can't be pooled — but they
+# also shouldn't destroy each other, so flipping the toggle in the front end
+# leaves the other space's work intact.
+SPACES = {"xy": 2, "body": 4}
+MAPPERS = {name: KernelMapper(dim=d) for name, d in SPACES.items()}
 LOCK = threading.Lock()
+
+
+def mapper_for(space):
+    return MAPPERS.get(space if space in MAPPERS else "xy")
 
 # decoder weights, flattened once in a fixed order the worklet knows
 _sd = MODEL.decoder.state_dict()
@@ -58,17 +67,19 @@ WEIGHTS_BLOB = np.concatenate(_chunks).tobytes()
 app = FastAPI()
 
 
-def state_json():
+def state_json(space="xy"):
+    m = mapper_for(space)
     return {
         # one row per thinned sample: [p_1..p_D, u_1..u_D, log_f0, loud, z_1..z_16]
         # u = unit tangent of the stroke there; all-zero = no clear direction
-        "points": (np.concatenate([MAPPER.S, MAPPER.U, MAPPER.T], axis=1).tolist()
-                   if MAPPER.ready else None),
-        "dim": MAPPER.dim,          # D of the gesture space; the worklet strides by it
-        "mode": MAPPER.mode,
-        "sigma": MAPPER.sigma,
-        "sigma_par": MAPPER.sigma_par,
-        "seconds": MAPPER.seconds,
+        "points": (np.concatenate([m.S, m.U, m.T], axis=1).tolist()
+                   if m.ready else None),
+        "space": space,
+        "dim": m.dim,               # D of the gesture space; the worklet strides by it
+        "mode": m.mode,
+        "sigma": m.sigma,
+        "sigma_par": m.sigma_par,
+        "seconds": m.seconds,
         "model": MODEL_NAME,
     }
 
@@ -90,13 +101,14 @@ def decoder_weights():
 
 
 @app.get("/api/state")
-def get_state():
+def get_state(space: str = "xy"):
     with LOCK:
-        return state_json()
+        return state_json(space)
 
 
 @app.post("/api/take")
-async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(...)):
+async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(...),
+                    space: str = Form("xy")):
     """audio: raw little-endian float32 mono; cursor: JSON [[t, p_1..p_D],...]
     (D=2 for the mouse pad, D=4 for the full-body features)."""
     raw = await audio.read()
@@ -107,7 +119,7 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
         wav = AF.resample(torch.from_numpy(wav).unsqueeze(0), sr, ddsp.SR)[0].numpy()
     if len(cur) < 6 or len(wav) < ddsp.SR // 2:
         with LOCK:
-            return {"ok": False, "reason": "take too short", **state_json()}
+            return {"ok": False, "reason": "take too short", **state_json(space)}
 
     wt = torch.tensor(wav, dtype=torch.float32).unsqueeze(0)
     n_frames = max(1, wt.shape[1] // ddsp.HOP)
@@ -122,34 +134,33 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
     pts = np.stack([np.interp(t, cur[:, 0], cur[:, j + 1]) for j in range(dim)],
                    axis=1)
     with LOCK:
-        MAPPER.add(pts, targets[:len(t)], seconds=len(wav) / ddsp.SR)
-        return {"ok": True, "path": pts.tolist(), **state_json()}
+        mapper_for(space).add(pts, targets[:len(t)], seconds=len(wav) / ddsp.SR)
+        return {"ok": True, "path": pts.tolist(), **state_json(space)}
 
 
 @app.post("/api/config")
 def post_config(mode: str = Form(None), sigma: float = Form(None),
-                sigma_par: float = Form(None)):
+                sigma_par: float = Form(None), space: str = Form("xy")):
     with LOCK:
+        m = mapper_for(space)
         if mode in ("iso", "aniso"):
-            MAPPER.mode = mode
+            m.mode = mode
         if sigma is not None:
             # ceiling is generous: in 4D points sit further apart than on the
             # 2D pad, so a usable across-width there runs well past the old 0.6
-            MAPPER.sigma = float(np.clip(sigma, 0.03, 1.2))
+            m.sigma = float(np.clip(sigma, 0.03, 1.2))
         if sigma_par is not None:
-            MAPPER.sigma_par = float(np.clip(sigma_par, 0.01, 0.3))
-        return state_json()
+            m.sigma_par = float(np.clip(sigma_par, 0.01, 0.3))
+        return state_json(space)
 
 
 @app.post("/api/clear")
-def post_clear(dim: int = Form(None)):
-    global MAPPER
+def post_clear(space: str = Form("xy")):
     with LOCK:
-        # the caller passes the width it is about to send points in (the front
-        # end switches spaces when the camera goes on/off); without it, keep
-        # the current one so a plain clear doesn't silently change the space
-        MAPPER = KernelMapper(dim=int(dim) if dim is not None else MAPPER.dim)
-        return state_json()
+        # only the named space is reset; the other modality keeps its work
+        name = space if space in MAPPERS else "xy"
+        MAPPERS[name] = KernelMapper(dim=SPACES[name])
+        return state_json(name)
 
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
