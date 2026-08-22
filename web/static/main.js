@@ -1,11 +1,11 @@
 /* Gesture instrument — browser front end.
- * LEFT-drag / either hand closed  = demonstrate (audio + path go to the server)
- * RIGHT-drag / both hands open    = play (kernel map -> decoder -> synth, local)
  *
- * The gesture space is D-dimensional. With the camera off it is the 2D pad
- * (mouse x, y). With the camera on it is the four full-body features below,
- * each scale- and translation-invariant so it doesn't matter how far from the
- * camera you stand or where in frame you are.
+ * Two modalities, chosen by the mode toggle and kept side by side:
+ *   x,y    mouse on the pad, or a tracked hand; pinch records, two fingers play
+ *   body   four full-body features; hands together for 3s toggles record/play
+ *
+ * The body features are scale- and translation-invariant, so it doesn't matter
+ * how far from the camera you stand or where in frame you are.
  */
 
 const canvas = document.getElementById("pad");
@@ -62,7 +62,7 @@ const legendEl = document.getElementById("legend");
 const LEGENDS = {
   xy: '<i class="r">left-drag / pinch</i> sing to teach &nbsp; '
     + '<i class="g">right-drag / two fingers</i> play',
-  body: '<i class="r">cross forearms 3s</i> record &nbsp; '
+  body: '<i class="r">hands together 3s</i> record &nbsp; '
       + '<i class="r">again</i> play &nbsp; <i class="g">hold 6s</i> stop',
 };
 
@@ -102,13 +102,13 @@ async function setSpace(next) {
   features = SPACE_FEATURES[space];
   demoPaths = demoPathsBy[space];
   pos = new Array(GDIM()).fill(0.5);
-  crossSince = 0; crossArmed = null;
+  holdSince = 0; holdArmed = null;
   state = await fetch(`/api/state?space=${space}`).then(r => r.json());
   if (node) sendMap();
   syncControls();
   hud();
   setStatus(space === "body"
-    ? "whole body — cross your forearms 3s to start recording"
+    ? "whole body — bring your hands together for 3s to start recording"
     : "x,y — hold LEFT + sing to demonstrate · hold RIGHT to play");
   spaceBtn.textContent = space === "body" ? "mode: whole body" : "mode: x,y";
   legendEl.innerHTML = LEGENDS[space];
@@ -259,12 +259,12 @@ function startTake(kind, byCam) {
 
 function endTake() {
   if (mode === "demo") {
-    // A take is stopped by crossing, which takes 3s — so the tail of the
-    // cursor is the cross itself, not playing. Drop everything from the moment
-    // the cross began; the server clips the audio to the cursor's last
+    // A take is stopped by the hold gesture, which takes 3s — so the tail of
+    // the cursor is the gesture itself, not playing. Drop everything from the
+    // moment the hold began; the server clips the audio to the cursor's last
     // timestamp, so the sung tail goes with it.
-    if (crossSince) {
-      const cutoff = crossSince - takeT0 / 1000;
+    if (holdSince) {
+      const cutoff = holdSince - takeT0 / 1000;
       const kept = cursor.filter((row) => row[0] <= cutoff);
       if (kept.length >= 6) cursor = kept;
     }
@@ -402,38 +402,41 @@ function classify(lm, prev) {
   return { g: null, x: p(8).x, y: p(8).y };
 }
 
-// ── body mode gesture: crossed forearms ─────────────────────────────────────
-/* The whole gesture is "do the forearms physically cross", tested as a segment
- * intersection between elbow->wrist on each side. That is a property of the
- * geometry itself, so it needs no thresholds and is already invariant to
- * scale, position and which way you face — unlike the finger poses, which
- * stopped being resolvable once the whole body is in frame.
+// ── body mode gesture: hands brought together ───────────────────────────────
+/* Just the distance between the two wrists, in torso lengths.
  *
- * Timing (all measured on a continuously-held cross, and acted on when you
- * uncross, so the cross pose itself never lands in a recording):
+ * This replaced crossed forearms, which the pose model could not read
+ * reliably: crossing puts one forearm in front of the other, and occlusion is
+ * exactly where landmark confidence collapses — the detector was least sure
+ * precisely while the gesture was being made. Here the arms stay separate and
+ * plainly visible, and wrist-to-wrist distance is also the one relationship
+ * the four features don't measure, so it can't be confused with playing.
+ *
+ * Timing (measured on a continuous hold, acted on when you separate your
+ * hands, so the gesture pose itself never lands in a recording):
  *   held >= 3s, then release -> toggle record <-> play
  *   held >= 6s, then release -> stop everything
  *   released before 3s       -> nothing happened                            */
-const CROSS_TOGGLE_S = 3.0;
-const CROSS_STOP_S   = 6.0;
-const CROSS_GAP_S    = 0.25;    // tracking dropout tolerated without resetting
-let crossSince = 0;             // when the current continuous cross began
-let crossLastSeen = 0;
-let crossArmed = null;          // "toggle" | "stop" — what release will do
+const HOLD_TOGGLE_S = 3.0;
+const HOLD_STOP_S   = 6.0;
+const HOLD_GAP_S    = 0.25;     // tracking dropout tolerated without resetting
+const TOGETHER_ENTER = 0.25;    // wrists within this (x torso) starts the hold
+const TOGETHER_EXIT  = 0.40;    // and must pass this to end it (hysteresis)
+let holdSince = 0;              // when the current continuous hold began
+let holdLastSeen = 0;
+let holdArmed = null;           // "toggle" | "stop" — what release will do
+let handsGap = null;            // latest wrist separation, for the overlay
 
-function segmentsCross(a1, a2, b1, b2) {
-  const side = (p, q, r) => (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
-  const d1 = side(b1, b2, a1), d2 = side(b1, b2, a2);
-  const d3 = side(a1, a2, b1), d4 = side(a1, a2, b2);
-  return ((d1 > 0) !== (d2 > 0)) && ((d3 > 0) !== (d4 > 0));
-}
-
-function forearmsCrossed(lm) {
-  const need = [PL.LEL, PL.REL, PL.LWR, PL.RWR];
+function handsTogether(lm) {
+  const need = [PL.LWR, PL.RWR, PL.LSH, PL.RSH, PL.LHIP, PL.RHIP];
   for (const i of need)
     if (!lm[i] || (lm[i].visibility !== undefined && lm[i].visibility < MIN_VIS))
       return false;
-  return segmentsCross(lm[PL.LEL], lm[PL.LWR], lm[PL.REL], lm[PL.RWR]);
+  const torso = dist(mid(lm[PL.LSH], lm[PL.RSH]), mid(lm[PL.LHIP], lm[PL.RHIP]));
+  if (!(torso > 1e-4)) return false;
+  handsGap = dist(lm[PL.LWR], lm[PL.RWR]) / torso;
+  // once holding, tolerate drifting a bit further apart before letting go
+  return holdSince ? handsGap < TOGETHER_EXIT : handsGap < TOGETHER_ENTER;
 }
 
 function camFrame(now) {
@@ -485,7 +488,7 @@ function frameXY(res, t) {
     moveTo([camPos.x, camPos.y]);
 }
 
-// body: the four features drive the point, crossed forearms drive the takes
+// body: the four features drive the point, the hold gesture drives the takes
 function frameBody(pres, t) {
   const lm = pres && pres.landmarks && pres.landmarks.length ? pres.landmarks[0] : null;
 
@@ -497,29 +500,30 @@ function frameBody(pres, t) {
   }
   if (t - lastBodySeen > 0.5) { bodyVec = null; bodyMarks = null; }
 
-  const crossed = lm ? forearmsCrossed(lm) : false;
-  if (crossed) {
-    if (!crossSince) crossSince = t;
-    crossLastSeen = t;
-    const held = t - crossSince;
-    crossArmed = held >= CROSS_STOP_S ? "stop"
-               : held >= CROSS_TOGGLE_S ? "toggle" : null;
-  } else if (crossSince && t - crossLastSeen > CROSS_GAP_S) {
-    applyCross(crossArmed);                    // acts on release, not on the hold
-    crossSince = 0; crossArmed = null;
+  if (!lm) handsGap = null;
+  const together = lm ? handsTogether(lm) : false;
+  if (together) {
+    if (!holdSince) holdSince = t;
+    holdLastSeen = t;
+    const held = t - holdSince;
+    holdArmed = held >= HOLD_STOP_S ? "stop"
+              : held >= HOLD_TOGGLE_S ? "toggle" : null;
+  } else if (holdSince && t - holdLastSeen > HOLD_GAP_S) {
+    applyHold(holdArmed);                      // acts on release, not on the hold
+    holdSince = 0; holdArmed = null;
   }
 
-  // while crossed, the arms are making a gesture rather than playing, so the
-  // point is frozen — otherwise crossing would smear across the whole map
-  if (bodyVec && !crossSince && (mode === "idle" || camDriving))
+  // while holding, the arms are making a gesture rather than playing, so the
+  // point is frozen — otherwise the gesture would smear across the whole map
+  if (bodyVec && !holdSince && (mode === "idle" || camDriving))
     moveTo(bodyVec.slice());
 }
 
-function applyCross(action) {
+function applyHold(action) {
   if (!action) return;
   if (action === "stop") {
     if (mode !== "idle") endTake();
-    setStatus("stopped — cross again for 3s to record");
+    setStatus("stopped — hands together 3s to record again");
     return;
   }
   // toggle: idle -> record, record -> play, play -> record
@@ -538,7 +542,7 @@ async function toggleCamera() {
     video.srcObject = null;
     camGesture = null;
     bodyVec = bodyMarks = null;
-    crossSince = 0; crossArmed = null;
+    holdSince = 0; holdArmed = null;
     camBtn.textContent = "camera: off";
     return;
   }
@@ -755,41 +759,54 @@ function drawFeatureBars() {
   ctx2d.restore();
 }
 
-/* The cross hold, as a ring that fills. Filling toward 3s means "release now
- * to switch"; past 3s it turns amber and starts refilling toward the 6s stop,
- * so both thresholds are visible while you hold rather than guessed at. */
-function drawCrossProgress() {
-  if (!crossSince) return;
-  const held = performance.now() / 1000 - crossSince;
+/* One ring, filling once over the whole 6s — the arc never restarts, so there
+ * is only ever a single timer to read. A notch on the ring marks the 3s point:
+ * arc short of the notch means nothing happens yet, past it means releasing
+ * switches, and all the way round means releasing stops. */
+function drawHoldProgress() {
+  if (!holdSince) return;
+  const held = performance.now() / 1000 - holdSince;
   const w = canvas.width, h = canvas.height;
   const cx = w / 2, cy = h / 2, r = 54;
-  const toStop = held >= CROSS_TOGGLE_S;
-  const frac = toStop
-    ? Math.min(1, (held - CROSS_TOGGLE_S) / (CROSS_STOP_S - CROSS_TOGGLE_S))
-    : held / CROSS_TOGGLE_S;
-  const color = toStop ? "#e0a54a" : "#5ac8e0";
+  const TAU = 2 * Math.PI, top = -Math.PI / 2;
+  const frac = Math.min(1, held / HOLD_STOP_S);
+  const notch = HOLD_TOGGLE_S / HOLD_STOP_S;       // where "switch" becomes armed
+  const past = held >= HOLD_TOGGLE_S;
 
   ctx2d.save();
   ctx2d.lineWidth = 9;
-  ctx2d.strokeStyle = "rgba(0,0,0,0.45)";
-  ctx2d.beginPath(); ctx2d.arc(cx, cy, r, 0, 2 * Math.PI); ctx2d.stroke();
-  ctx2d.strokeStyle = color;
+  ctx2d.strokeStyle = "rgba(0,0,0,0.5)";           // track
+  ctx2d.beginPath(); ctx2d.arc(cx, cy, r, 0, TAU); ctx2d.stroke();
+
+  ctx2d.strokeStyle = past ? "#e0a54a" : "#5ac8e0";
   ctx2d.lineCap = "round";
   ctx2d.beginPath();
-  ctx2d.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + frac * 2 * Math.PI);
+  ctx2d.arc(cx, cy, r, top, top + frac * TAU);
+  ctx2d.stroke();
+
+  // the 3s threshold, drawn on the ring itself
+  const a = top + notch * TAU;
+  ctx2d.lineWidth = 3;
+  ctx2d.strokeStyle = "rgba(255,255,255,0.85)";
+  ctx2d.beginPath();
+  ctx2d.moveTo(cx + Math.cos(a) * (r - 9), cy + Math.sin(a) * (r - 9));
+  ctx2d.lineTo(cx + Math.cos(a) * (r + 9), cy + Math.sin(a) * (r + 9));
   ctx2d.stroke();
 
   const next = mode === "demo" ? "play" : "record";
-  const label = toStop ? "keep holding → stop" : `release → ${next}`;
-  ctx2d.font = "bold 13px ui-monospace, monospace";
+  const outlined = (txt, y, font) => {
+    ctx2d.font = font;
+    ctx2d.lineWidth = 4;
+    ctx2d.strokeStyle = "rgba(0,0,0,0.8)";
+    ctx2d.strokeText(txt, cx, y);
+    ctx2d.fillStyle = "#fff";
+    ctx2d.fillText(txt, cx, y);
+  };
   ctx2d.textAlign = "center";
   ctx2d.textBaseline = "middle";
-  ctx2d.lineWidth = 4;
-  ctx2d.strokeStyle = "rgba(0,0,0,0.75)";
-  ctx2d.strokeText(label, cx, cy + r + 22);
-  ctx2d.fillStyle = "#fff";
-  ctx2d.fillText(label, cx, cy + r + 22);
-  ctx2d.fillText(held.toFixed(1) + "s", cx, cy);
+  outlined(held.toFixed(1) + "s", cy, "bold 17px ui-monospace, monospace");
+  outlined(past ? `release → stop` : `release → ${next}`, cy + r + 22,
+           "bold 13px ui-monospace, monospace");
   ctx2d.restore();
 }
 
@@ -800,13 +817,13 @@ function drawModeBanner() {
   const w = canvas.width, h = canvas.height;
   const rec = mode === "demo", play = mode === "trace";
   if (!rec && !play) {
-    if (space === "body" && !crossSince) {
+    if (space === "body" && !holdSince) {
       ctx2d.save();
       ctx2d.font = "bold 13px ui-monospace, monospace";
       ctx2d.textAlign = "center";
       ctx2d.lineWidth = 4;
       ctx2d.strokeStyle = "rgba(0,0,0,0.75)";
-      const msg = "cross your forearms for 3s to start recording";
+      const msg = "bring your hands together for 3s to start recording";
       ctx2d.strokeText(msg, w / 2, h - 18);
       ctx2d.fillStyle = "rgba(225,225,240,0.95)";
       ctx2d.fillText(msg, w / 2, h - 18);
@@ -831,6 +848,42 @@ function drawModeBanner() {
   ctx2d.fillRect(w / 2 - tw / 2 - 14, h - 54, tw + 28, 32);
   ctx2d.fillStyle = "#0b0b14";
   ctx2d.fillText(label, w / 2, h - 38);
+  ctx2d.restore();
+}
+
+/* Transport state in the corner, in the usual symbols: filled circle for
+ * recording, triangle for playing, square for stopped. Always drawn, in both
+ * modalities, so there is one fixed place to look for "what is it doing".
+ * Shapes rather than glyphs — no font dependency, and crisp at any size. */
+function drawTransport() {
+  const pw = 104, ph = 34, x = canvas.width - pw - 12, y = 12;
+  const rec = mode === "demo", play = mode === "trace";
+  const color = rec ? "#e65c5c" : play ? "#5ac882" : "#9696aa";
+  const label = rec ? "REC" : play ? "PLAY" : "STOP";
+  const sx = x + 22, sy = y + ph / 2, r = 9;
+
+  ctx2d.save();
+  ctx2d.fillStyle = "rgba(8,8,16,0.66)";
+  ctx2d.fillRect(x, y, pw, ph);
+  // recording pulses; the other two are steady
+  ctx2d.globalAlpha = rec ? 0.6 + 0.4 * Math.abs(Math.sin(performance.now() / 380)) : 1;
+  ctx2d.fillStyle = color;
+  ctx2d.beginPath();
+  if (rec) {
+    ctx2d.arc(sx, sy, r, 0, 2 * Math.PI);
+  } else if (play) {
+    ctx2d.moveTo(sx - r * 0.75, sy - r);
+    ctx2d.lineTo(sx + r, sy);
+    ctx2d.lineTo(sx - r * 0.75, sy + r);
+    ctx2d.closePath();
+  } else {
+    ctx2d.rect(sx - r * 0.82, sy - r * 0.82, r * 1.64, r * 1.64);
+  }
+  ctx2d.fill();
+  ctx2d.font = "bold 13px ui-monospace, monospace";
+  ctx2d.textAlign = "left";
+  ctx2d.textBaseline = "middle";
+  ctx2d.fillText(label, sx + r + 11, sy);
   ctx2d.restore();
 }
 
@@ -871,9 +924,10 @@ function draw() {
   }
 
   drawFeatureBars();
+  drawTransport();
   if (camOn) {
     drawModeBanner();
-    if (space === "body") drawCrossProgress();
+    if (space === "body") drawHoldProgress();
   }
   requestAnimationFrame(draw);
 }
