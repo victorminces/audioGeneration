@@ -118,6 +118,12 @@
       <span class="val" id="sigxv">·</span></label>
     <label id="sigpRow">along <input type="range" id="sigp" min="0.01" max="0.3" step="0.005">
       <span class="val" id="sigpv">·</span></label>
+    <label title="how far from the demonstrations it stays audible, in widths">reach
+      <input type="range" id="reach" min="1" max="8" step="0.1">
+      <span class="val" id="reachv">·</span></label>
+    <label title="noise branch level; 1 = exactly as the model was trained">breath
+      <input type="range" id="breath" min="0" max="1.5" step="0.05" value="1">
+      <span class="val" id="breathv">1.00</span></label>
   </div>
 </main>
 <video id="cam" playsinline muted style="display:none"></video>

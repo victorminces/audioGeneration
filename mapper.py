@@ -50,6 +50,15 @@ class KernelMapper:
         self.mode = "aniso"
         self.sigma = 0.15                       # across-stroke width (iso: only width)
         self.sigma_par = 0.04                   # along-stroke width (aniso only)
+        # How far the *gain* reaches, as a multiple of sigma. Averaging and
+        # fading want opposite things: a narrow kernel keeps the timbre crisp
+        # (averaging many different z vectors sounds breathy, since the mean of
+        # several distinct spectra is broadband), while a wide one is what
+        # keeps the instrument audible between demonstrations. One sigma can't
+        # do both, so the confidence gets its own radius. Higher dimensions
+        # need more of it: the same demonstrations sit much further apart in
+        # 4-D than on the 2-D pad, so the nearest sample is rarely close.
+        self.reach = 1.0 if dim <= 2 else 3.0
         self.dim = dim                          # D of the gesture space
         self.data_p = []                        # raw per-take points, kept for
         self.data_t = []                        # save/load and re-thinning
@@ -133,7 +142,10 @@ class KernelMapper:
             e = d2 / (2 * self.sigma ** 2)
         k = np.exp(-e)
         sw = k.sum(axis=1)
-        conf = k.max(axis=1)
+        # gain uses the same nearest-sample distance but a wider sigma, which
+        # scales the exponent by 1/reach^2 — so the averaging stays as sharp as
+        # sigma says while the fade to silence is gentler
+        conf = np.exp(-e.min(axis=1) / (self.reach ** 2))
         pred = (k @ self.T) / (sw[:, None] + 1e-12)
         return pred, conf
 
@@ -143,7 +155,7 @@ class KernelMapper:
                    else np.zeros((0, self.dim)),
                  t=np.concatenate(self.data_t) if self.data_t
                    else np.zeros((0, self.N_OUT)),
-                 dim=self.dim,
+                 dim=self.dim, reach=self.reach,
                  sigma=self.sigma, sigma_par=self.sigma_par, mode=self.mode,
                  seconds=self.seconds, ddsp_name=ddsp_name)
 
@@ -153,6 +165,7 @@ class KernelMapper:
         self.data_p = [p] if len(p) else []
         self.data_t = [z["t"]] if len(z["t"]) else []
         self.dim = int(z["dim"]) if "dim" in z else (p.shape[1] if len(p) else 2)
+        self.reach = float(z["reach"]) if "reach" in z else (1.0 if self.dim <= 2 else 3.0)
         self.sigma = float(z["sigma"])
         self.sigma_par = float(z["sigma_par"]) if "sigma_par" in z else 0.04
         self.mode = str(z["mode"]) if "mode" in z else "aniso"

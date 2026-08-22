@@ -70,6 +70,8 @@ const LEGENDS = {
 const modeEl = document.getElementById("mode");
 const sigxEl = document.getElementById("sigx"), sigxV = document.getElementById("sigxv");
 const sigpEl = document.getElementById("sigp"), sigpV = document.getElementById("sigpv");
+const reachEl = document.getElementById("reach"), reachV = document.getElementById("reachv");
+const breathEl = document.getElementById("breath"), breathV = document.getElementById("breathv");
 
 function syncControls() {
   modeEl.value = state.mode;
@@ -77,6 +79,10 @@ function syncControls() {
   sigpEl.value = state.sigma_par;
   sigxV.textContent = state.sigma.toFixed(3);
   sigpV.textContent = state.sigma_par.toFixed(3);
+  if (reachEl) {
+    reachEl.value = state.reach ?? 1;
+    reachV.textContent = (state.reach ?? 1).toFixed(1) + "×";
+  }
   const aniso = state.mode === "aniso";
   sigpEl.disabled = !aniso;
   document.getElementById("sigpRow").style.opacity = aniso ? 1 : 0.35;
@@ -141,6 +147,20 @@ modeEl.addEventListener("change", () => postConfig({ mode: modeEl.value }));
 sigxEl.addEventListener("input", () => { sigxV.textContent = (+sigxEl.value).toFixed(3); });
 sigpEl.addEventListener("input", () => { sigpV.textContent = (+sigpEl.value).toFixed(3); });
 sigxEl.addEventListener("change", () => postConfig({ sigma: sigxEl.value }));
+// Guarded: a browser holding a cached index.html without these controls used
+// to throw here, and a throw at top level kills every declaration below it —
+// the whole instrument died over two optional sliders.
+if (reachEl) {
+  reachEl.addEventListener("input", () => { reachV.textContent = (+reachEl.value).toFixed(1) + "×"; });
+  reachEl.addEventListener("change", () => postConfig({ reach: reachEl.value }));
+}
+// breath never reaches the server: it trims the synth, not the map
+if (breathEl) {
+  breathEl.addEventListener("input", () => {
+    breathV.textContent = (+breathEl.value).toFixed(2);
+    if (node) node.port.postMessage({ type: "breath", value: +breathEl.value });
+  });
+}
 sigpEl.addEventListener("change", () => postConfig({ sigma_par: sigpEl.value }));
 
 // ── boot ─────────────────────────────────────────────────────────────────────
@@ -156,7 +176,7 @@ async function boot() {
 
   audioCtx = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
   // cache-bust: addModule ignores hard-refresh, so pin the worklet version
-  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=4");
+  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=5");
   node = new AudioWorkletNode(audioCtx, "instrument", {
     numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { manifest, weights: weightsBuf, constants: manifest.constants },
@@ -182,7 +202,7 @@ async function boot() {
 
 function sendMap() {
   node.port.postMessage({ type: "map", points: state.points, mode: state.mode,
-                          dim: state.dim || GDIM(),
+                          dim: state.dim || GDIM(), reach: state.reach ?? 1,
                           sigma: state.sigma, sigmaPar: state.sigma_par });
 }
 

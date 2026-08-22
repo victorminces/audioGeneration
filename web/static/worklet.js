@@ -41,6 +41,8 @@ class Instrument extends AudioWorkletProcessor {
     this.nOut = 2 + this.C.Z_DIM;
     this.sigma = 0.15;                       // across-stroke width
     this.sigmaPar = 0.04;                    // along-stroke width (aniso mode)
+    this.reach = 1.0;                        // gain radius, in multiples of sigma
+    this.breath = 1.0;                       // noise-branch trim (1 = as trained)
     this.fade = 0.0;                         // confidence gain (silence off-data)
 
     // control state (written by messages, read by the render loop). Fixed
@@ -74,9 +76,12 @@ class Instrument extends AudioWorkletProcessor {
   }
 
   _onMessage(m) {
-    if (m.type === "map") {
+    if (m.type === "breath") {
+      this.breath = m.value;
+    } else if (m.type === "map") {
       this.sigma = m.sigma;
       this.sigmaPar = m.sigmaPar;
+      if (m.reach) this.reach = m.reach;
       const D = Math.min(m.dim || 2, MAX_DIM);
       this.dim = D;
       if (m.points && m.points.length) {
@@ -123,7 +128,7 @@ class Instrument extends AudioWorkletProcessor {
     const sp2 = 2 * this.sigmaPar * this.sigmaPar;
     const D = this.dim, stride = 2 * D + this.nOut, P = this.pts, q = this.pos;
     out.fill(0);
-    let sw = 0, wmax = 0;
+    let sw = 0, emin = Infinity;
     for (let i = 0; i < this.nPts; i++) {
       const o = i * stride;
       // squared distance and the component along this sample's tangent, both
@@ -135,15 +140,18 @@ class Instrument extends AudioWorkletProcessor {
         along += dj * P[o + D + j];
       }
       const across2 = Math.max(d2 - along * along, 0);
-      const w = Math.exp(-along * along / sp2 - across2 / sx2);
+      const e = along * along / sp2 + across2 / sx2;
+      const w = Math.exp(-e);
       sw += w;
-      if (w > wmax) wmax = w;
+      if (e < emin) emin = e;
       const base = o + 2 * D;
       for (let j = 0; j < this.nOut; j++) out[j] += w * P[base + j];
     }
     const inv = 1 / (sw + 1e-12);
     for (let j = 0; j < this.nOut; j++) out[j] *= inv;
-    return wmax;
+    // widening sigma by `reach` divides the exponent by reach^2 — averaging
+    // stays as sharp as sigma says, only the fade to silence gets gentler
+    return emin === Infinity ? 0 : Math.exp(-emin / (this.reach * this.reach));
   }
 
   // ── decoder ───────────────────────────────────────────────────────────────
@@ -303,14 +311,19 @@ class Instrument extends AudioWorkletProcessor {
     re.fill(0); im.fill(0);
     for (let i = 0; i < hop; i++) re[i] = Math.random() * 2 - 1;
     this._fft(re, im, false);
-    // real filter gain per bin: 65 bands span 0..MODEL_SR/2, zero above
-    const nb = this.C.N_NOISE, noise = this._noise;
+    // real filter gain per bin: 65 bands span 0..MODEL_SR/2, zero above.
+    // `breath` trims the whole noise branch: the decoder's balance is what it
+    // learned from speech, which carries more breath than a sustained
+    // instrument tone wants, and averaging several timbres pushes it further
+    // that way. 1 = exactly as trained.
+    const nb = this.C.N_NOISE, noise = this._noise, br = this.breath;
     for (let k = 0; k <= bins; k++) {
       const frac = (k * sampleRate / N) / (MODEL_SR / 2);
       let g = 0;
       if (frac <= 1) {
         const pos = frac * (nb - 1), i0 = Math.floor(pos), t = pos - i0;
         g = i0 >= nb - 1 ? noise[nb - 1] : noise[i0] * (1 - t) + noise[i0 + 1] * t;
+        g *= br;
       }
       re[k] *= g; im[k] *= g;
       if (k > 0 && k < bins) { re[N - k] *= g; im[N - k] *= g; }

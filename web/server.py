@@ -79,6 +79,7 @@ def state_json(space="xy"):
         "mode": m.mode,
         "sigma": m.sigma,
         "sigma_par": m.sigma_par,
+        "reach": m.reach,
         "seconds": m.seconds,
         "model": MODEL_NAME,
     }
@@ -140,7 +141,8 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
 
 @app.post("/api/config")
 def post_config(mode: str = Form(None), sigma: float = Form(None),
-                sigma_par: float = Form(None), space: str = Form("xy")):
+                sigma_par: float = Form(None), reach: float = Form(None),
+                space: str = Form("xy")):
     with LOCK:
         m = mapper_for(space)
         if mode in ("iso", "aniso"):
@@ -151,6 +153,8 @@ def post_config(mode: str = Form(None), sigma: float = Form(None),
             m.sigma = float(np.clip(sigma, 0.03, 1.2))
         if sigma_par is not None:
             m.sigma_par = float(np.clip(sigma_par, 0.01, 0.3))
+        if reach is not None:
+            m.reach = float(np.clip(reach, 1.0, 8.0))
         return state_json(space)
 
 
@@ -174,7 +178,25 @@ def hand_model():
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(STATIC, "index.html"))
+    return FileResponse(os.path.join(STATIC, "index.html"),
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.middleware("http")
+async def no_cache(request, call_next):
+    """Never let the browser hold on to the front end or the map state.
+
+    Two failures this prevents, both seen in practice: a cached index.html
+    paired with a fresh main.js, where the script looks for controls the stale
+    markup doesn't have; and a cached GET /api/state, where the front end is
+    handed an empty map that the server filled in long ago. Everything here is
+    tiny and served from localhost, so caching buys nothing.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/static/") or path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
