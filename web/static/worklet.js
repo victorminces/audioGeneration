@@ -17,6 +17,8 @@
 
 const MODEL_SR = 16000;
 const MAX_DIM = 8;                 // gesture-space capacity; 2 (pad) and 4 (body) today
+const NOISE_CAP = 0.2;             // noise power ceiling as a share of harmonic
+                                   // power, above the trained pitch range only
 
 class Instrument extends AudioWorkletProcessor {
   constructor(options) {
@@ -251,11 +253,28 @@ class Instrument extends AudioWorkletProcessor {
     for (let r = 0; r < this.C.N_HARMONICS; r++) this._harm[r] /= (hs + 1e-7);
 
     const Wn = this.T["head_noise.weight"].d, bn = this.T["head_noise.bias"].d;
+    let npow = 0;
     for (let r = 0; r < this.C.N_NOISE; r++) {
       let s = bn[r];
       const o = r * 256;
       for (let c = 0; c < 256; c++) s += Wn[o + c] * this._h3[c];
       this._noise[r] = this._expSig(s);
+      npow += this._noise[r] * this._noise[r];
+    }
+
+    /* Above the pitch the model was trained to, the harmonic branch keeps
+     * extrapolating sensibly but the noise branch does not: a 1500 Hz whistle
+     * came back with 67x the noise-to-harmonic ratio of speech, which is
+     * exactly the "all breathy" complaint. Pitch alone can't gate this — a
+     * taper by f0 still left 700 Hz wrong — so the noise is bounded against
+     * the harmonic power it accompanies, and only where the head was never
+     * trained. Inside the range nothing is touched at all. */
+    if (f0 > this.f0ScaleMax && npow > 0) {
+      const allowed = NOISE_CAP * amp * amp;
+      if (npow > allowed) {
+        const g = Math.sqrt(allowed / npow);
+        for (let r = 0; r < this.C.N_NOISE; r++) this._noise[r] *= g;
+      }
     }
     return amp;
   }

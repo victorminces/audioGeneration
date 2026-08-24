@@ -176,7 +176,7 @@ async function boot() {
 
   audioCtx = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
   // cache-bust: addModule ignores hard-refresh, so pin the worklet version
-  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=8");
+  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=9");
   node = new AudioWorkletNode(audioCtx, "instrument", {
     numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { manifest, weights: weightsBuf, constants: manifest.constants },
