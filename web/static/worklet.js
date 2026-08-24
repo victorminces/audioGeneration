@@ -30,6 +30,14 @@ class Instrument extends AudioWorkletProcessor {
       this.T[t.name] = { d: all.subarray(t.offset, t.offset + n), shape: t.shape };
     }
 
+    // pitch range the loaded checkpoint was trained on — its weights read f0
+    // on this scale, so an older 60-600 model stays in tune rather than being
+    // transposed by whatever today's default happens to be
+    this.f0Min = this.C.F0_MIN || 60;
+    this.f0Max = this.C.F0_MAX || 600;
+    this.f0Lo = Math.log2(this.f0Min);
+    this.f0Span = Math.log2(this.f0Max / this.f0Min);
+
     this.hop = Math.round(this.C.HOP * sampleRate / MODEL_SR);
     this.noiseFFT = 1 << Math.ceil(Math.log2(2 * this.hop));   // 512 at 16 kHz
     this._initFFT(this.noiseFFT);
@@ -194,7 +202,7 @@ class Instrument extends AudioWorkletProcessor {
 
   decodeFrame(f0, loud, z) {
     const x18 = this._x18;
-    x18[0] = (Math.log2(Math.max(f0, 1)) - 5.9) / 3.3;
+    x18[0] = (Math.log2(Math.max(f0, 1)) - this.f0Lo) / this.f0Span;
     x18[1] = (loud + 8) / 8;
     for (let i = 0; i < this.C.Z_DIM; i++) x18[2 + i] = z[i];
 
@@ -265,7 +273,7 @@ class Instrument extends AudioWorkletProcessor {
 
     const p = this._p;
     const conf = this.predict(p);
-    const f0 = Math.min(600, Math.max(60, Math.exp(p[0])));
+    const f0 = Math.min(this.f0Max, Math.max(this.f0Min, Math.exp(p[0])));
     const amp = this.decodeFrame(f0, p[1], p.subarray(2));
     const harm = this._harm, H = this.C.N_HARMONICS;
 

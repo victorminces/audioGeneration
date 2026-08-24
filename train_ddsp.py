@@ -49,13 +49,52 @@ def _iter_clips(data_dir, clip_samples):
             yield wav_t[:, i * clip_samples:(i + 1) * clip_samples]
 
 
-def build_cache(data_dir, clip_seconds, cache_path):
+def synth_tones(n, clip_samples, rng):
+    """Whistle-like clips spanning the upper pitch range.
+
+    LibriSpeech f0 sits around 80-300 Hz, which after scaling occupies only
+    the bottom of the model's f0 input. Train on it alone and the top of a
+    widened range is never exercised — the network has no idea what to do
+    there, which is exactly why whistling produced nothing. These fill it in.
+
+    They are deliberately whistle-shaped: near-sinusoidal, with vibrato, a
+    weak second partial and a little breath. The model already renders pure
+    tones well at pitches it *has* seen, so what it needs is examples at the
+    pitches, not a new kind of timbre.
+    """
+    out = []
+    t = np.arange(clip_samples) / ddsp.SR
+    for _ in range(n):
+        f0 = float(np.exp(rng.uniform(np.log(400.0), np.log(ddsp.F0_MAX * 0.95))))
+        drift = f0 * (1 + rng.uniform(-0.25, 0.25) * t / max(t[-1], 1e-9))
+        vib = drift * (1 + rng.uniform(0.002, 0.012)
+                       * np.sin(2 * np.pi * rng.uniform(3.5, 7.0) * t))
+        ph = 2 * np.pi * np.cumsum(vib) / ddsp.SR
+        x = np.sin(ph) + rng.uniform(0.02, 0.15) * np.sin(2 * ph)
+        x += rng.uniform(0.005, 0.03) * rng.normal(0, 1, clip_samples)
+        # fade in/out so the take has attacks rather than clicks
+        env = np.ones(clip_samples)
+        k = int(0.05 * ddsp.SR)
+        env[:k] = np.linspace(0, 1, k); env[-k:] = np.linspace(1, 0, k)
+        x = x * env * rng.uniform(0.25, 0.7) / (np.abs(x).max() + 1e-9)
+        out.append(torch.tensor(x, dtype=torch.float32).unsqueeze(0))
+    return out
+
+
+def build_cache(data_dir, clip_seconds, cache_path, synth_frac=0.0, seed=0):
     """Analyze every clip in data_dir into (wav, f0, loud, mel) and save as .npz."""
     clip_samples = int(clip_seconds * ddsp.SR)
     n_frames = clip_samples // ddsp.HOP
 
+    clips = list(_iter_clips(data_dir, clip_samples))
+    if synth_frac > 0:
+        rng = np.random.default_rng(seed)
+        n = int(round(len(clips) * synth_frac))
+        clips += synth_tones(n, clip_samples, rng)
+        print(f"  + {n} synthetic high-pitch clips (400-{ddsp.F0_MAX:.0f} Hz)")
+
     wavs, f0s, louds, mels = [], [], [], []
-    for wav in _iter_clips(data_dir, clip_samples):
+    for wav in clips:
         f0 = ddsp.extract_f0(wav, n_frames)
         loud = ddsp.extract_loudness(wav, n_frames)
         mel = ddsp.mel_frames(wav, n_frames)
@@ -99,7 +138,8 @@ def _next_name():
 def train(args):
     cache_path = args.cache or os.path.join(CHECKPOINT_DIR, "ddsp_cache.npz")
     if args.rebuild_cache or not os.path.exists(cache_path):
-        build_cache(args.data_dir, args.clip_seconds, cache_path)
+        build_cache(args.data_dir, args.clip_seconds, cache_path,
+                    synth_frac=args.synth_frac, seed=args.seed)
 
     data = np.load(cache_path)
     wav, f0, loud, mel = (torch.from_numpy(data[k]) for k in ("wav", "f0", "loud", "mel"))
@@ -151,6 +191,8 @@ def train(args):
             "steps": target_step, "steps_done": step_done,
             "batch_size": args.batch_size, "lr": args.lr,
             "clip_seconds": args.clip_seconds, "val_frac": args.val_frac,
+            "f0_min": ddsp.F0_MIN, "f0_max": ddsp.F0_MAX,
+            "synth_frac": args.synth_frac,
             "clips_used": n, "loss_history": loss_history,
             "note": f"DDSP harmonic+noise, timbre z={ddsp.Z_DIM}, trained via train_ddsp.py"
                    + ("" if step_done == target_step else " (in progress)"),
@@ -217,6 +259,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val-frac", type=float, default=0.1)
+    parser.add_argument("--synth-frac", type=float, default=0.30,
+                        help="synthetic high-pitch clips, as a fraction of the "
+                             "real ones, so the top of the f0 range is trained")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-name", default=None,
                         help="Checkpoint name (default: --resume's name, or an "
                              "auto-incrementing ddsp_NNN for a fresh run)")

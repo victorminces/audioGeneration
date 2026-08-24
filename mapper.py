@@ -191,7 +191,13 @@ def load_latest_ddsp(proj=None):
     if not cfgs:
         raise RuntimeError("No DDSP checkpoint found — train one first.")
     _, cfg, pt = max(cfgs)
-    m = ddsp.DDSP()
+    # A checkpoint's weights interpret f0 on the scale it was trained with, so
+    # the range comes from its config rather than today's default. Checkpoints
+    # written before the range was widened have no entry and were all trained
+    # on 60-600; loading one with the current default would transpose
+    # everything it plays by well over an octave.
+    m = ddsp.DDSP(f0_min=float(cfg.get("f0_min", 60.0)),
+                  f0_max=float(cfg.get("f0_max", 600.0)))
     m.load_state_dict(torch.load(pt, map_location="cpu", weights_only=True))
     m.eval()
     return m, cfg["name"]

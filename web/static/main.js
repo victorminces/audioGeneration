@@ -176,7 +176,7 @@ async function boot() {
 
   audioCtx = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
   // cache-bust: addModule ignores hard-refresh, so pin the worklet version
-  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=6");
+  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=7");
   node = new AudioWorkletNode(audioCtx, "instrument", {
     numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { manifest, weights: weightsBuf, constants: manifest.constants },
@@ -218,16 +218,30 @@ function sendMap() {
  *
  * Levels are in log-RMS, the same units the server analyses takes in, so the
  * number sent with the take is directly comparable to what it measures.       */
-const FLOOR_MARGIN = 2.5;       // log-RMS above the room floor (~22 dB)
 const CAL_MIN_SAMPLES = 12;     // ~0.8 s of hold before the floor is trusted
+const DB_PER_LN = 8.686;        // 20/ln(10): log-RMS units -> dB, for the slider
 let micLoud = -12;              // current mic level
-let roomFloor = null;           // measured during the hold
-let loudThreshold = null;       // roomFloor + margin; null until calibrated
+let roomFloor = null;           // measured during a hold (authoritative)
+let floorTracked = -9.0;        // continuous follower, used when there is no hold
+let floorMargin = 2.5;          // how far above the floor counts, set by the slider
 let calSamples = [];            // level samples collected during this hold
+
+// Falls instantly to a new quiet level and climbs back very slowly (~1 log unit
+// per two minutes), so it settles on the room rather than chasing your voice.
+// It exists so the meter means something before any hold has happened at all,
+// and in x,y mode, which has no hold gesture to calibrate from.
+function trackFloor(v) {
+  if (v < floorTracked) floorTracked = v;
+  else floorTracked = Math.min(-2.0, floorTracked + 0.0008);
+}
+
+const micFloor = () => (roomFloor !== null ? roomFloor : floorTracked);
+const micThreshold = () => micFloor() + floorMargin;
 
 function onWorklet(m) {
   if (m.type === "level") {
     micLoud = Math.log(m.rms + 1e-5);          // matches ddsp.extract_loudness
+    trackFloor(micLoud);
     if (holdSince) calSamples.push(micLoud);   // hands together = room only
   } else if (m.type === "take") {
     uploadTake(new Float32Array(m.audio));
@@ -241,12 +255,24 @@ function calibrateFloor() {
   if (calSamples.length < CAL_MIN_SAMPLES) { calSamples = []; return; }
   const s = calSamples.slice().sort((a, b) => a - b);
   roomFloor = s[Math.floor(s.length * 0.25)];
-  loudThreshold = roomFloor + FLOOR_MARGIN;
+  floorTracked = roomFloor;                    // the measured one is better
   calSamples = [];
 }
 
 // is what the mic hears right now loud enough to be learned?
-const capturing = () => loudThreshold !== null && micLoud > loudThreshold;
+const capturing = () => micLoud > micThreshold();
+
+// Placed here deliberately: this reads floorMargin and DB_PER_LN, which are
+// declared just above. Wired up higher with the other sliders it would throw
+// at load — and a top-level throw takes every declaration below it with it.
+const gateEl = document.getElementById("gate"), gateV = document.getElementById("gatev");
+if (gateEl) {
+  floorMargin = (+gateEl.value) / DB_PER_LN;
+  gateEl.addEventListener("input", () => {
+    gateV.textContent = `${gateEl.value} dB`;
+    floorMargin = (+gateEl.value) / DB_PER_LN;   // takes effect on the meter at once
+  });
+}
 
 // ── takes ────────────────────────────────────────────────────────────────────
 async function uploadTake(audio) {
@@ -264,7 +290,7 @@ async function uploadTake(audio) {
   fd.append("space", space);
   // the threshold measured from the room during the hold, so the server drops
   // exactly what the live indicator said it would
-  if (loudThreshold !== null) fd.append("loud_threshold", String(loudThreshold));
+  fd.append("loud_threshold", String(micThreshold()));
   try {
     const r = await fetch("/api/take", { method: "POST", body: fd }).then(r => r.json());
     if (r.ok) {
@@ -972,10 +998,10 @@ function drawMicMeter(x, y, w) {
   ctx2d.fillRect(x, y, w, h);
   ctx2d.fillStyle = capturing() ? "#e65c5c" : "rgba(200,200,220,0.45)";
   ctx2d.fillRect(x, y, at(micLoud) * w, h);
-  if (loudThreshold !== null) {                 // where the room floor put it
-    ctx2d.fillStyle = "#ffffff";
-    ctx2d.fillRect(x + at(loudThreshold) * w - 1, y - 2, 2, h + 4);
-  }
+  ctx2d.fillStyle = "rgba(120,200,255,0.55)";   // the measured room floor
+  ctx2d.fillRect(x + at(micFloor()) * w - 1, y, 2, h);
+  ctx2d.fillStyle = "#ffffff";                  // the gate, moved by the slider
+  ctx2d.fillRect(x + at(micThreshold()) * w - 1, y - 2, 2, h + 4);
   ctx2d.restore();
 }
 

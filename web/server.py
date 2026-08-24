@@ -133,9 +133,12 @@ def decoder_manifest():
     return {
         "tensors": _manifest,
         "total": _off,
+        # F0_MIN/MAX come from the loaded checkpoint, not the module defaults:
+        # the worklet must scale f0 exactly the way these weights were trained
         "constants": {"SR": ddsp.SR, "HOP": ddsp.HOP,
                       "N_HARMONICS": ddsp.N_HARMONICS,
-                      "N_NOISE": ddsp.N_NOISE, "Z_DIM": ddsp.Z_DIM},
+                      "N_NOISE": ddsp.N_NOISE, "Z_DIM": ddsp.Z_DIM,
+                      "F0_MIN": MODEL.f0_min, "F0_MAX": MODEL.f0_max},
     }
 
 

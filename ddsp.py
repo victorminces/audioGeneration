@@ -21,17 +21,29 @@ N_NOISE     = 65             # noise filter bands
 Z_DIM       = 16
 N_MELS      = 80
 
+# Pitch range the model is trained over. 60-600 was speech-shaped: LibriSpeech
+# f0 sits around 80-300 Hz. 2000 is the ceiling of the detector rather than a
+# choice — torchcrepe is a classifier over 360 bins of 20 cents from C1
+# (32.7 Hz), which is six octaves and stops at 2092 Hz, with MAX_FMAX = 2006.
+# Ask for more and it can only answer with a subharmonic.
+#
+# The scaling below is baked into a trained model's weights, so a checkpoint
+# carries the range it was trained with (see train_ddsp.py / load_latest_ddsp)
+# and these are only the defaults for a fresh one.
+F0_MIN = 60.0
+F0_MAX = 2000.0
+
 _mel = T.MelSpectrogram(sample_rate=SR, n_fft=1024, hop_length=HOP, n_mels=N_MELS)
 
 
 # ── analysis ──────────────────────────────────────────────────────────────────
 
-def extract_f0(wav, n_frames):
+def extract_f0(wav, n_frames, f0_min=F0_MIN, f0_max=F0_MAX):
     """(1, samples) -> (n_frames,) f0 in Hz (unvoiced frames get held/low values;
     the decoder learns to silence harmonics there via the amplitude head)."""
     # weighted_argmax decoder is pure torch (the default viterbi decoder pulls
     # in librosa -> numba, which breaks against numpy >= 2.2)
-    f0 = torchcrepe.predict(wav, SR, hop_length=HOP, fmin=60, fmax=600,
+    f0 = torchcrepe.predict(wav, SR, hop_length=HOP, fmin=f0_min, fmax=f0_max,
                             model="tiny", batch_size=512, device="cpu",
                             decoder=torchcrepe.decode.weighted_argmax)[0]
     return F.interpolate(f0.view(1, 1, -1), size=n_frames,
@@ -54,8 +66,10 @@ def mel_frames(wav, n_frames):
                          mode="linear", align_corners=True)[0].T
 
 
-def scale_f0(f0):
-    return (f0.clamp(min=1).log2() - 5.9) / 3.3           # ~[60, 600] Hz -> ~[0, 1]
+def scale_f0(f0, f0_min=F0_MIN, f0_max=F0_MAX):
+    """Hz -> ~[0, 1] over the model's trained pitch range."""
+    lo = float(np.log2(f0_min))
+    return (f0.clamp(min=1).log2() - lo) / float(np.log2(f0_max / f0_min))
 
 
 def scale_loud(loud):
@@ -107,10 +121,13 @@ class Decoder(nn.Module):
 
 
 class DDSP(nn.Module):
-    def __init__(self):
+    def __init__(self, f0_min=F0_MIN, f0_max=F0_MAX):
         super().__init__()
         self.encoder = TimbreEncoder()
         self.decoder = Decoder()
+        # not parameters — the range the weights were trained to interpret,
+        # restored from the checkpoint's config rather than the state dict
+        self.f0_min, self.f0_max = f0_min, f0_max
 
     # -- synthesis ------------------------------------------------------------
     @staticmethod
@@ -153,7 +170,8 @@ class DDSP(nn.Module):
     def forward(self, mels, f0, loud):
         """mels (B,T,80); f0 (B,T) Hz; loud (B,T) log-rms -> (B, samples)."""
         z = self.encoder(mels)
-        amp, harm, noise = self.decoder(scale_f0(f0), scale_loud(loud), z)
+        amp, harm, noise = self.decoder(scale_f0(f0, self.f0_min, self.f0_max),
+                                        scale_loud(loud), z)
         return self.synthesize(f0, amp, harm, noise)
 
 
@@ -179,7 +197,7 @@ def multiscale_spectral_loss(x, y):
 def analyze(model, wav):
     """(1, samples) -> dict of per-frame params (f0 Hz, loud, z)."""
     n_frames = wav.shape[1] // HOP
-    f0   = extract_f0(wav, n_frames)
+    f0   = extract_f0(wav, n_frames, model.f0_min, model.f0_max)
     loud = extract_loudness(wav, n_frames)
     mels = mel_frames(wav, n_frames)
     with torch.no_grad():
@@ -200,7 +218,8 @@ def blend_params(params_list, weights):
 def synthesize_params(model, params):
     """Parameter dict -> (1, samples) waveform."""
     with torch.no_grad():
-        amp, harm, noise = model.decoder(scale_f0(params["f0"]).unsqueeze(0),
+        amp, harm, noise = model.decoder(
+            scale_f0(params["f0"], model.f0_min, model.f0_max).unsqueeze(0),
                                          scale_loud(params["loud"]).unsqueeze(0),
                                          params["z"].unsqueeze(0))
         wav = model.synthesize(params["f0"].unsqueeze(0), amp, harm, noise)
@@ -230,7 +249,9 @@ class StreamingSynth:
         """One decoder step with carried GRU state -> (amp, harm, noise) frames."""
         d = self.model.decoder
         x = torch.empty(1, 1, 2 + Z_DIM, dtype=torch.float32)
-        x[0, 0, 0] = (np.log2(max(f0, 1.0)) - 5.9) / 3.3     # scale_f0, scalar
+        lo = np.log2(self.model.f0_min)                       # scale_f0, scalar
+        span = np.log2(self.model.f0_max / self.model.f0_min)
+        x[0, 0, 0] = (np.log2(max(f0, 1.0)) - lo) / span
         x[0, 0, 1] = (loud + 8.0) / 8.0                      # scale_loud, scalar
         x[0, 0, 2:] = torch.from_numpy(np.asarray(z, dtype=np.float32))
         with torch.inference_mode():
