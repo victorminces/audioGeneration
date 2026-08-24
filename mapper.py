@@ -190,7 +190,13 @@ def load_latest_ddsp(proj=None):
                 cfgs.append((os.path.getmtime(pt), cfg, pt))
     if not cfgs:
         raise RuntimeError("No DDSP checkpoint found — train one first.")
-    _, cfg, pt = max(cfgs)
+    # Prefer a finished checkpoint over one still being written. train_ddsp.py
+    # saves every few hundred steps so a run can be auditioned early, but the
+    # newest file on disk during a long run is a half-trained model, and
+    # picking it up automatically silently swaps a good voice for a worse one.
+    done = [c for c in cfgs
+            if c[1].get("steps_done", c[1].get("steps", 0)) >= c[1].get("steps", 0)]
+    _, cfg, pt = max(done or cfgs)
     # A checkpoint's weights interpret f0 on the scale it was trained with, so
     # the range comes from its config rather than today's default. Checkpoints
     # written before the range was widened have no entry and were all trained
