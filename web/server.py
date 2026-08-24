@@ -196,20 +196,14 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
     # of the amplitude. Storing them means the instrument is quiet and breathy
     # wherever you happened to be standing while not singing, which is most of
     # the gesture space.
-    # Prefer the threshold the front end measured from the room during the hold
+    # Use the threshold the front end measured from the room during the hold
     # gesture: it is what the live indicator was showing while you sang, so what
-    # gets dropped is exactly what you were told would be dropped. Fall back to
-    # splitting the take's own distribution when there was no calibration (the
-    # x,y modality has no hold gesture) or when trusting it would leave almost
-    # nothing — a cough during the hold shouldn't cost you the take.
+    # gets dropped is exactly what you were told would be dropped. Without one
+    # (the x,y modality has no hold gesture) fall back to splitting the take's
+    # own loudness distribution.
     loud_col = tg[:, 1]
-    keep = None
-    if loud_threshold is not None:
-        cal = loud_col > float(loud_threshold)
-        if cal.mean() >= 0.15:
-            keep = cal
-    if keep is None:
-        keep = voiced_mask(loud_col)
+    keep = (loud_col > float(loud_threshold) if loud_threshold is not None
+            else voiced_mask(loud_col))
     dropped = int(len(keep) - keep.sum())
     if keep.sum() >= 6:                         # unless that leaves nothing to fit
         pts, tg = pts[keep], tg[keep]

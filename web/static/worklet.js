@@ -17,8 +17,15 @@
 
 const MODEL_SR = 16000;
 const MAX_DIM = 8;                 // gesture-space capacity; 2 (pad) and 4 (body) today
+// TEMPORARY — remove when a model trained over the full pitch range lands.
+// This is a stopgap, not a design: a tuned constant applied only in one region.
+// It exists because ddsp_003's noise head was never trained above 600 Hz and
+// asks for absurd amounts of noise there (67x speech's ratio at 1500 Hz).
+// ddsp_004 is training on high-pitch material precisely so this is unnecessary;
+// once it is in use, delete this constant and the block in decodeFrame that
+// reads it. The block is already inert for such a model — it only fires above
+// f0ScaleMax — so "it still works" is not evidence it is still needed.
 const NOISE_CAP = 0.2;             // noise power ceiling as a share of harmonic
-                                   // power, above the trained pitch range only
 
 class Instrument extends AudioWorkletProcessor {
   constructor(options) {

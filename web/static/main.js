@@ -79,10 +79,8 @@ function syncControls() {
   sigpEl.value = state.sigma_par;
   sigxV.textContent = state.sigma.toFixed(3);
   sigpV.textContent = state.sigma_par.toFixed(3);
-  if (reachEl) {
-    reachEl.value = state.reach ?? 1;
-    reachV.textContent = (state.reach ?? 1).toFixed(1) + "×";
-  }
+  reachEl.value = state.reach ?? 1;
+  reachV.textContent = (state.reach ?? 1).toFixed(1) + "×";
   const aniso = state.mode === "aniso";
   sigpEl.disabled = !aniso;
   document.getElementById("sigpRow").style.opacity = aniso ? 1 : 0.35;
@@ -147,20 +145,13 @@ modeEl.addEventListener("change", () => postConfig({ mode: modeEl.value }));
 sigxEl.addEventListener("input", () => { sigxV.textContent = (+sigxEl.value).toFixed(3); });
 sigpEl.addEventListener("input", () => { sigpV.textContent = (+sigpEl.value).toFixed(3); });
 sigxEl.addEventListener("change", () => postConfig({ sigma: sigxEl.value }));
-// Guarded: a browser holding a cached index.html without these controls used
-// to throw here, and a throw at top level kills every declaration below it —
-// the whole instrument died over two optional sliders.
-if (reachEl) {
-  reachEl.addEventListener("input", () => { reachV.textContent = (+reachEl.value).toFixed(1) + "×"; });
-  reachEl.addEventListener("change", () => postConfig({ reach: reachEl.value }));
-}
+reachEl.addEventListener("input", () => { reachV.textContent = (+reachEl.value).toFixed(1) + "×"; });
+reachEl.addEventListener("change", () => postConfig({ reach: reachEl.value }));
 // breath never reaches the server: it trims the synth, not the map
-if (breathEl) {
-  breathEl.addEventListener("input", () => {
-    breathV.textContent = (+breathEl.value).toFixed(2);
-    if (node) node.port.postMessage({ type: "breath", value: +breathEl.value });
-  });
-}
+breathEl.addEventListener("input", () => {
+  breathV.textContent = (+breathEl.value).toFixed(2);
+  if (node) node.port.postMessage({ type: "breath", value: +breathEl.value });
+});
 sigpEl.addEventListener("change", () => postConfig({ sigma_par: sigpEl.value }));
 
 // ── boot ─────────────────────────────────────────────────────────────────────
@@ -266,13 +257,11 @@ const capturing = () => micLoud > micThreshold();
 // declared just above. Wired up higher with the other sliders it would throw
 // at load — and a top-level throw takes every declaration below it with it.
 const gateEl = document.getElementById("gate"), gateV = document.getElementById("gatev");
-if (gateEl) {
-  floorMargin = (+gateEl.value) / DB_PER_LN;
-  gateEl.addEventListener("input", () => {
-    gateV.textContent = `${gateEl.value} dB`;
-    floorMargin = (+gateEl.value) / DB_PER_LN;   // takes effect on the meter at once
-  });
-}
+floorMargin = (+gateEl.value) / DB_PER_LN;
+gateEl.addEventListener("input", () => {
+  gateV.textContent = `${gateEl.value} dB`;
+  floorMargin = (+gateEl.value) / DB_PER_LN;     // takes effect on the meter at once
+});
 
 // ── takes ────────────────────────────────────────────────────────────────────
 async function uploadTake(audio) {
