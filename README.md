@@ -23,7 +23,7 @@ python server.py       # or: uvicorn server:app --port 8321
 
 Then open `http://127.0.0.1:8321` in a browser with webcam/microphone
 permissions available. A trained DDSP checkpoint ships with the repo
-(`checkpoints/ddsp_003.pt`), so this works immediately on a fresh clone —
+(`checkpoints/ddsp_004.pt`), so this works immediately on a fresh clone —
 no training required to get started.
 
 ## Architecture
@@ -98,19 +98,21 @@ has `"domain": "ddsp"`.
 Key options (`python train_ddsp.py --help`): `--steps`, `--batch-size`,
 `--lr`, `--clip-seconds`, `--out-name`. To continue training an existing
 checkpoint rather than starting over: `--resume <name>` (e.g.
-`python train_ddsp.py --resume ddsp_003 --steps 5000` trains 5000 more steps
+`python train_ddsp.py --resume ddsp_004 --steps 5000` trains 5000 more steps
 on top of it, under the same checkpoint name). A quick smoke test:
 `python train_ddsp.py --steps 200 --batch-size 8`.
 
 ### What to expect
 
-`checkpoints/ddsp_003.pt` (the shipped default, 20000 steps, ~501 LibriSpeech
-files / 1538 two-second clips) plateaued hard around step 8000-9000 — val
-loss went from 1.44 (step 50) to 0.84 (step 9000) to 0.839 (step 20000).
-The last ~11000 steps bought essentially nothing on this metric. On CPU
-(no CUDA), expect roughly 4s/step, so a full 20000-step run is close to a day
-of wall time; stopping around step 8000-10000 gets you nearly all the
-measurable quality for a fraction of the compute. That said, this loss number
-covers the whole signal at once (pitch + timbre + noise) and can plateau
-while small perceptual details keep improving — listening (via "sing to
-teach") is the real test, not just the number.
+`checkpoints/ddsp_004.pt` (the shipped default) was trained on ~501
+LibriSpeech files plus synthetic high-pitch tones, over 60-2000 Hz. It stopped
+at 9375 steps because validation loss had been flat for ~1900 steps; ddsp_003
+plateaued at much the same point, so expect little from a longer run on this
+data. On CPU (no CUDA) budget roughly a day for 20000 steps.
+
+Two notes on reading the loss. It covers the whole signal at once — pitch,
+timbre and noise together — so it can plateau while perceptual details keep
+improving; listening via "sing to teach" is the real test. And it is not
+comparable between models trained on different data: ddsp_004 reports a worse
+val figure than ddsp_003 purely because its validation set contains the
+high-pitch material. Measured directly on speech, the two are within 0.4%.

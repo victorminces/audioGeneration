@@ -25,6 +25,7 @@ falls back to round behavior there.
 import glob
 import json
 import os
+import re
 
 import numpy as np
 import torch
@@ -178,6 +179,19 @@ class KernelMapper:
         return str(z["ddsp_name"])
 
 
+def _ckpt_rank(cfg, pt):
+    """Order checkpoints by their number, not their timestamp.
+
+    ddsp_NNN names are already assigned in order, so the number is the real
+    version. Modification time is not: git does not preserve mtimes, so every
+    file in a fresh clone is stamped at checkout and whichever model loads
+    would be arbitrary. Falls back to mtime only for a name that doesn't fit
+    the pattern.
+    """
+    m = re.match(r"ddsp_(\d+)$", os.path.splitext(os.path.basename(pt))[0])
+    return (1, int(m.group(1))) if m else (0, os.path.getmtime(pt))
+
+
 def load_latest_ddsp(proj=None):
     proj = proj or os.path.dirname(os.path.abspath(__file__))
     cfgs = []
@@ -187,7 +201,7 @@ def load_latest_ddsp(proj=None):
         if cfg.get("domain") == "ddsp":
             pt = os.path.join(proj, "checkpoints", cfg["filename"])
             if os.path.exists(pt):
-                cfgs.append((os.path.getmtime(pt), cfg, pt))
+                cfgs.append((_ckpt_rank(cfg, pt), cfg, pt))
     if not cfgs:
         raise RuntimeError("No DDSP checkpoint found — train one first.")
     # Prefer a finished checkpoint over one still being written. train_ddsp.py

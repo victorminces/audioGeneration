@@ -31,8 +31,8 @@ checkpoints/*
 *.pt
 *.pth
 *.ckpt
-!checkpoints/ddsp_003.pt
-!checkpoints/ddsp_003.json
+!checkpoints/ddsp_004.pt
+!checkpoints/ddsp_004.json
 
 # Outputs
 outputs/

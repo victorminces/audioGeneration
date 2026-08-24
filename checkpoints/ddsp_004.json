@@ -1,0 +1,147 @@
+{
+  "name": "ddsp_004",
+  "filename": "ddsp_004.pt",
+  "domain": "ddsp",
+  "model_type": "ddsp",
+  "arch": "ddsp",
+  "latent_ch": 16,
+  "latent_units": 16,
+  "steps": 9375,
+  "steps_done": 9375,
+  "batch_size": 32,
+  "lr": 0.001,
+  "clip_seconds": 2.0,
+  "val_frac": 0.1,
+  "f0_min": 60.0,
+  "f0_max": 2000.0,
+  "synth_frac": 0.3,
+  "clips_used": 1999,
+  "loss_history": [
+    {
+      "step": 375,
+      "recon": 0.96342,
+      "val_recon": 0.97017
+    },
+    {
+      "step": 750,
+      "recon": 0.9106,
+      "val_recon": 0.9292
+    },
+    {
+      "step": 1125,
+      "recon": 0.88401,
+      "val_recon": 0.91209
+    },
+    {
+      "step": 1500,
+      "recon": 0.88812,
+      "val_recon": 0.89619
+    },
+    {
+      "step": 1875,
+      "recon": 0.88211,
+      "val_recon": 0.88144
+    },
+    {
+      "step": 2250,
+      "recon": 0.89276,
+      "val_recon": 0.88527
+    },
+    {
+      "step": 2625,
+      "recon": 0.85221,
+      "val_recon": 0.87425
+    },
+    {
+      "step": 3000,
+      "recon": 0.85101,
+      "val_recon": 0.86451
+    },
+    {
+      "step": 3375,
+      "recon": 0.84385,
+      "val_recon": 0.86298
+    },
+    {
+      "step": 3750,
+      "recon": 0.84497,
+      "val_recon": 0.86345
+    },
+    {
+      "step": 4125,
+      "recon": 0.82514,
+      "val_recon": 0.87055
+    },
+    {
+      "step": 4500,
+      "recon": 0.84605,
+      "val_recon": 0.8591
+    },
+    {
+      "step": 4875,
+      "recon": 0.83945,
+      "val_recon": 0.85897
+    },
+    {
+      "step": 5250,
+      "recon": 0.83813,
+      "val_recon": 0.85435
+    },
+    {
+      "step": 5625,
+      "recon": 0.83336,
+      "val_recon": 0.85323
+    },
+    {
+      "step": 6000,
+      "recon": 0.83019,
+      "val_recon": 0.85118
+    },
+    {
+      "step": 6375,
+      "recon": 0.84116,
+      "val_recon": 0.85096
+    },
+    {
+      "step": 6750,
+      "recon": 0.83904,
+      "val_recon": 0.84955
+    },
+    {
+      "step": 7125,
+      "recon": 0.8318,
+      "val_recon": 0.84906
+    },
+    {
+      "step": 7500,
+      "recon": 0.82188,
+      "val_recon": 0.84753
+    },
+    {
+      "step": 7875,
+      "recon": 0.83322,
+      "val_recon": 0.84729
+    },
+    {
+      "step": 8250,
+      "recon": 0.82423,
+      "val_recon": 0.8481
+    },
+    {
+      "step": 8625,
+      "recon": 0.83104,
+      "val_recon": 0.84766
+    },
+    {
+      "step": 9000,
+      "recon": 0.81938,
+      "val_recon": 0.84663
+    },
+    {
+      "step": 9375,
+      "recon": 0.82111,
+      "val_recon": 0.84726
+    }
+  ],
+  "note": "DDSP harmonic+noise, timbre z=16, trained via train_ddsp.py \u2014 stopped early at 9375 steps (val plateaued)"
+}
