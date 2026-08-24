@@ -49,7 +49,7 @@ def _iter_clips(data_dir, clip_samples):
             yield wav_t[:, i * clip_samples:(i + 1) * clip_samples]
 
 
-def synth_tones(n, clip_samples, rng):
+def synth_tones(n, clip_samples, rng, air_max=0.03, f_lo=400.0):
     """Whistle-like clips spanning the upper pitch range.
 
     LibriSpeech f0 sits around 80-300 Hz, which after scaling occupies only
@@ -65,13 +65,19 @@ def synth_tones(n, clip_samples, rng):
     out = []
     t = np.arange(clip_samples) / ddsp.SR
     for _ in range(n):
-        f0 = float(np.exp(rng.uniform(np.log(400.0), np.log(ddsp.F0_DETECT_MAX * 0.95))))
+        f0 = float(np.exp(rng.uniform(np.log(f_lo), np.log(ddsp.F0_DETECT_MAX * 0.99))))
         drift = f0 * (1 + rng.uniform(-0.25, 0.25) * t / max(t[-1], 1e-9))
         vib = drift * (1 + rng.uniform(0.002, 0.012)
                        * np.sin(2 * np.pi * rng.uniform(3.5, 7.0) * t))
         ph = 2 * np.pi * np.cumsum(vib) / ddsp.SR
         x = np.sin(ph) + rng.uniform(0.02, 0.15) * np.sin(2 * ph)
-        x += rng.uniform(0.005, 0.03) * rng.normal(0, 1, clip_samples)
+        # Air down to exactly zero. Starting this at 0.005 was the bug behind
+        # breathy whistles: nothing the model ever saw was cleaner than 0.5%
+        # noise, so a real whistle fell off the end of its experience and the
+        # amplitude head answered with no tone at all — 220x collapse at
+        # 1800 Hz. A whistle is close to a pure sine; the training set has to
+        # contain that.
+        x += rng.uniform(0.0, air_max) * rng.normal(0, 1, clip_samples)
         # fade in/out so the take has attacks rather than clicks
         env = np.ones(clip_samples)
         k = int(0.05 * ddsp.SR)
@@ -79,6 +85,42 @@ def synth_tones(n, clip_samples, rng):
         x = x * env * rng.uniform(0.25, 0.7) / (np.abs(x).max() + 1e-9)
         out.append(torch.tensor(x, dtype=torch.float32).unsqueeze(0))
     return out
+
+
+def analyze_clips(clips, n_frames):
+    """(1, samples) waveforms -> stacked (wav, f0, loud, mel) arrays."""
+    wavs, f0s, louds, mels = [], [], [], []
+    for wav in clips:
+        wavs.append(wav[0].numpy())
+        f0s.append(ddsp.extract_f0(wav, n_frames).numpy())
+        louds.append(ddsp.extract_loudness(wav, n_frames).numpy())
+        mels.append(ddsp.mel_frames(wav, n_frames).numpy())
+        print(f"\r  analyzed {len(wavs)} clips", end="", flush=True)
+    print()
+    return [np.stack(a) for a in (wavs, f0s, louds, mels)]
+
+
+def append_tones(cache_path, n, clip_seconds, air_max, f_lo, seed):
+    """Add synthetic tones to an existing cache without re-analysing the rest.
+
+    The speech clips take far longer to analyse than the tones do (pitch
+    tracking dominates), and they have not changed — so filling a gap in the
+    tone coverage should not cost a full rebuild.
+    """
+    clip_samples = int(clip_seconds * ddsp.SR)
+    n_frames = clip_samples // ddsp.HOP
+    rng = np.random.default_rng(seed)
+    print(f"  generating {n} tones: air 0-{air_max}, {f_lo:.0f}-"
+          f"{ddsp.F0_DETECT_MAX * 0.99:.0f} Hz")
+    fresh = analyze_clips(synth_tones(n, clip_samples, rng, air_max, f_lo), n_frames)
+    with np.load(cache_path) as old:
+        n_before = len(old["wav"])
+        merged = {k: np.concatenate([old[k], f]) for k, f in
+                  zip(("wav", "f0", "loud", "mel"), fresh)}
+    # np.load is lazy, so the handle must be closed before overwriting the same
+    # path — and nothing may read from it afterwards
+    np.savez(cache_path, **merged)
+    print(f"  cache {n_before} -> {len(merged['wav'])} clips")
 
 
 def build_cache(data_dir, clip_seconds, cache_path, synth_frac=0.0, seed=0):
@@ -140,6 +182,9 @@ def train(args):
     if args.rebuild_cache or not os.path.exists(cache_path):
         build_cache(args.data_dir, args.clip_seconds, cache_path,
                     synth_frac=args.synth_frac, seed=args.seed)
+    elif args.append_tones:
+        append_tones(cache_path, args.append_tones, args.clip_seconds,
+                     args.append_air_max, args.append_f_lo, args.seed + 1)
 
     data = np.load(cache_path)
     wav, f0, loud, mel = (torch.from_numpy(data[k]) for k in ("wav", "f0", "loud", "mel"))
@@ -156,20 +201,31 @@ def train(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ddsp.DDSP().to(device)
 
     start_step = 0
     loss_history = []
+    f0_min, f0_max = ddsp.F0_SCALE_MIN, ddsp.F0_SCALE_MAX
     name = args.out_name or args.resume or _next_name()
+    prev_cfg = None
     if args.resume:
-        resume_pt = os.path.join(CHECKPOINT_DIR, f"{args.resume}.pt")
         resume_json = os.path.join(CHECKPOINT_DIR, f"{args.resume}.json")
         with open(resume_json) as f:
             prev_cfg = json.load(f)
         start_step = prev_cfg.get("steps_done", prev_cfg.get("steps", 0))
         loss_history = prev_cfg.get("loss_history", [])
+        # The scale is baked into the weights being resumed, so it has to come
+        # from the checkpoint rather than today's default. Without this, loading
+        # a 60-2000 model under a 60-600 default would misread every pitch by
+        # nearly an octave and a half and quietly train on the error.
+        f0_min = float(prev_cfg.get("f0_min", 60.0))
+        f0_max = float(prev_cfg.get("f0_max", 600.0))
+
+    model = ddsp.DDSP(f0_min=f0_min, f0_max=f0_max).to(device)
+    if args.resume:
+        resume_pt = os.path.join(CHECKPOINT_DIR, f"{args.resume}.pt")
         model.load_state_dict(torch.load(resume_pt, map_location=device))
-        print(f"Resuming from {args.resume} at step {start_step}")
+        print(f"Resuming from {args.resume} at step {start_step} "
+              f"(f0 scale {f0_min:.0f}-{f0_max:.0f} Hz, from its config)")
 
     target_step = start_step + args.steps
 
@@ -266,6 +322,14 @@ def main():
     parser.add_argument("--out-name", default=None,
                         help="Checkpoint name (default: --resume's name, or an "
                              "auto-incrementing ddsp_NNN for a fresh run)")
+    parser.add_argument("--append-tones", type=int, default=0,
+                        help="add N synthetic tones to the existing cache and "
+                             "reuse the rest, instead of rebuilding it")
+    parser.add_argument("--append-air-max", type=float, default=0.008,
+                        help="upper bound on added noise for --append-tones; the "
+                             "lower bound is always 0, which is the point")
+    parser.add_argument("--append-f-lo", type=float, default=700.0,
+                        help="lowest pitch for --append-tones")
     parser.add_argument("--resume", default=None,
                         help="Existing checkpoint name to continue training from "
                              "(e.g. ddsp_003)")
