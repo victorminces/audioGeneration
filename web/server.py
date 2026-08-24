@@ -38,6 +38,9 @@ print(f"model: {MODEL_NAME}", flush=True)
 # also shouldn't destroy each other, so flipping the toggle in the front end
 # leaves the other space's work intact.
 SPACES = {"xy": 2, "body": 4}
+# How far below a take's own sung level a frame has to be before it counts as
+# "not singing", in log-RMS. 3.0 is about 26 dB down.
+SILENCE_DROP = 3.0
 MAPPERS = {name: KernelMapper(dim=d) for name, d in SPACES.items()}
 LOCK = threading.Lock()
 
@@ -134,9 +137,31 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
     dim = cur.shape[1] - 1                      # column 0 is the timestamp
     pts = np.stack([np.interp(t, cur[:, 0], cur[:, j + 1]) for j in range(dim)],
                    axis=1)
+    tg = targets[:len(t)]
+
+    # Drop the frames you weren't actually singing on.
+    #
+    # A take is bracketed by getting into position and punctuated by breathing
+    # between phrases, and those frames are near-silent. The decoder renders
+    # them faithfully — as almost pure noise: measured on this model, frames in
+    # the quietest 40% come out ~170x breathier than sung ones, at a thousandth
+    # of the amplitude. Storing them means the instrument is quiet and breathy
+    # wherever you happened to be standing while not singing, which is most of
+    # the gesture space. The threshold is relative to the take's own level, so
+    # it follows how loudly you sing rather than assuming a microphone gain.
+    loud_col = tg[:, 1]
+    keep = loud_col > (np.percentile(loud_col, 90) - SILENCE_DROP)
+    dropped = int(len(keep) - keep.sum())
+    if keep.sum() >= 6:                         # unless that leaves nothing to fit
+        pts, tg = pts[keep], tg[keep]
+    else:
+        dropped = 0
+
     with LOCK:
-        mapper_for(space).add(pts, targets[:len(t)], seconds=len(wav) / ddsp.SR)
-        return {"ok": True, "path": pts.tolist(), **state_json(space)}
+        mapper_for(space).add(pts, tg, seconds=len(tg) * ddsp.HOP / ddsp.SR)
+        return {"ok": True, "path": pts.tolist(),
+                "dropped_seconds": round(dropped * ddsp.HOP / ddsp.SR, 2),
+                **state_json(space)}
 
 
 @app.post("/api/config")

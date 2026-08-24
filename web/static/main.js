@@ -230,7 +230,10 @@ async function uploadTake(audio) {
       state = r;
       demoPaths.push(r.path);
       sendMap();
-      setStatus(`map updated: ${r.seconds.toFixed(1)}s total (${demoPaths.length} takes)`);
+      const drop = r.dropped_seconds
+        ? `, ${r.dropped_seconds.toFixed(1)}s of silence dropped` : "";
+      setStatus(`map updated: ${r.seconds.toFixed(1)}s total `
+              + `(${demoPaths.length} takes${drop})`);
     } else {
       setStatus(r.reason || "take rejected");
     }

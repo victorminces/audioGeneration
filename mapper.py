@@ -50,15 +50,19 @@ class KernelMapper:
         self.mode = "aniso"
         self.sigma = 0.15                       # across-stroke width (iso: only width)
         self.sigma_par = 0.04                   # along-stroke width (aniso only)
-        # How far the *gain* reaches, as a multiple of sigma. Averaging and
-        # fading want opposite things: a narrow kernel keeps the timbre crisp
-        # (averaging many different z vectors sounds breathy, since the mean of
-        # several distinct spectra is broadband), while a wide one is what
-        # keeps the instrument audible between demonstrations. One sigma can't
-        # do both, so the confidence gets its own radius. Higher dimensions
-        # need more of it: the same demonstrations sit much further apart in
-        # 4-D than on the 2-D pad, so the nearest sample is rarely close.
-        self.reach = 1.0 if dim <= 2 else 3.0
+        # How far the *gain* reaches, as a multiple of sigma. Widening sigma by
+        # reach divides the exponent by reach^2, so this only softens the fade
+        # to silence — the averaging stays exactly as sharp as sigma says. It
+        # exists because the same demonstrations sit much further apart in 4-D
+        # than on the 2-D pad, so the nearest sample is rarely close and the
+        # instrument reads as too quiet.
+        #
+        # 2.0 rather than something larger: reach is really conf^(1/reach^2),
+        # and by 3.0 the fade is all but gone (measured: level only 1.6x down
+        # right across the space, versus 36x at reach 1), which throws away the
+        # "silent where you never taught it" behaviour. At 2.0 the level in the
+        # region you actually play is ~2x up and the fade still fades.
+        self.reach = 1.0 if dim <= 2 else 2.0
         self.dim = dim                          # D of the gesture space
         self.data_p = []                        # raw per-take points, kept for
         self.data_t = []                        # save/load and re-thinning
