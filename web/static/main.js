@@ -176,7 +176,7 @@ async function boot() {
 
   audioCtx = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
   // cache-bust: addModule ignores hard-refresh, so pin the worklet version
-  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=5");
+  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=6");
   node = new AudioWorkletNode(audioCtx, "instrument", {
     numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { manifest, weights: weightsBuf, constants: manifest.constants },
@@ -206,9 +206,47 @@ function sendMap() {
                           sigma: state.sigma, sigmaPar: state.sigma_par });
 }
 
+/* Mic level, and the threshold above which singing counts as material.
+ *
+ * The hold gesture gives us a calibration window for free: you cannot be
+ * singing into the microphone while holding your hands together for three
+ * seconds to start a take, so whatever the mic hears then is the room — its
+ * fans, its traffic, your breathing. Measuring that and putting the threshold
+ * a fixed margin above it means the threshold is known *before* recording
+ * begins, which is what makes live feedback possible at all: the take-level
+ * analysis can only ever tell you afterwards.
+ *
+ * Levels are in log-RMS, the same units the server analyses takes in, so the
+ * number sent with the take is directly comparable to what it measures.       */
+const FLOOR_MARGIN = 2.5;       // log-RMS above the room floor (~22 dB)
+const CAL_MIN_SAMPLES = 12;     // ~0.8 s of hold before the floor is trusted
+let micLoud = -12;              // current mic level
+let roomFloor = null;           // measured during the hold
+let loudThreshold = null;       // roomFloor + margin; null until calibrated
+let calSamples = [];            // level samples collected during this hold
+
 function onWorklet(m) {
-  if (m.type === "take") uploadTake(new Float32Array(m.audio));
+  if (m.type === "level") {
+    micLoud = Math.log(m.rms + 1e-5);          // matches ddsp.extract_loudness
+    if (holdSince) calSamples.push(micLoud);   // hands together = room only
+  } else if (m.type === "take") {
+    uploadTake(new Float32Array(m.audio));
+  }
 }
+
+/* Turn a completed hold into a threshold. Uses a low percentile rather than
+ * the mean so one cough during the hold can't lift the floor and start
+ * discarding real singing. */
+function calibrateFloor() {
+  if (calSamples.length < CAL_MIN_SAMPLES) { calSamples = []; return; }
+  const s = calSamples.slice().sort((a, b) => a - b);
+  roomFloor = s[Math.floor(s.length * 0.25)];
+  loudThreshold = roomFloor + FLOOR_MARGIN;
+  calSamples = [];
+}
+
+// is what the mic hears right now loud enough to be learned?
+const capturing = () => loudThreshold !== null && micLoud > loudThreshold;
 
 // ── takes ────────────────────────────────────────────────────────────────────
 async function uploadTake(audio) {
@@ -224,6 +262,9 @@ async function uploadTake(audio) {
   fd.append("cursor", JSON.stringify(cur));
   fd.append("sr", String(audioCtx.sampleRate));
   fd.append("space", space);
+  // the threshold measured from the room during the hold, so the server drops
+  // exactly what the live indicator said it would
+  if (loudThreshold !== null) fd.append("loud_threshold", String(loudThreshold));
   try {
     const r = await fetch("/api/take", { method: "POST", body: fd }).then(r => r.json());
     if (r.ok) {
@@ -532,6 +573,9 @@ function frameBody(pres, t) {
     holdArmed = held >= HOLD_STOP_S ? "stop"
               : held >= HOLD_TOGGLE_S ? "toggle" : null;
   } else if (holdSince && t - holdLastSeen > HOLD_GAP_S) {
+    // the hold just ended — everything the mic heard during it was the room,
+    // so turn it into the threshold before the take it is about to start
+    calibrateFloor();
     applyHold(holdArmed);                      // acts on release, not on the hold
     holdSince = 0; holdArmed = null;
   }
@@ -879,18 +923,23 @@ function drawModeBanner() {
  * modalities, so there is one fixed place to look for "what is it doing".
  * Shapes rather than glyphs — no font dependency, and crisp at any size. */
 function drawTransport() {
-  const pw = 104, ph = 34, x = canvas.width - pw - 12, y = 12;
+  const pw = 132, ph = 34, x = canvas.width - pw - 12, y = 12;
   const rec = mode === "demo", play = mode === "trace";
-  const color = rec ? "#e65c5c" : play ? "#5ac882" : "#9696aa";
-  const label = rec ? "REC" : play ? "PLAY" : "STOP";
+  // While recording, red only means "this is going into the map". Below the
+  // threshold the take is still running but nothing is being learned, so it
+  // goes hollow and amber rather than lying to you with a solid red dot.
+  const live = rec && capturing();
+  const color = rec ? (live ? "#e65c5c" : "#c8912f") : play ? "#5ac882" : "#9696aa";
+  const label = rec ? (live ? "REC" : "too soft") : play ? "PLAY" : "STOP";
   const sx = x + 22, sy = y + ph / 2, r = 9;
 
   ctx2d.save();
   ctx2d.fillStyle = "rgba(8,8,16,0.66)";
   ctx2d.fillRect(x, y, pw, ph);
-  // recording pulses; the other two are steady
-  ctx2d.globalAlpha = rec ? 0.6 + 0.4 * Math.abs(Math.sin(performance.now() / 380)) : 1;
-  ctx2d.fillStyle = color;
+  ctx2d.globalAlpha = rec && live
+    ? 0.6 + 0.4 * Math.abs(Math.sin(performance.now() / 380)) : 1;
+  ctx2d.strokeStyle = ctx2d.fillStyle = color;
+  ctx2d.lineWidth = 2.5;
   ctx2d.beginPath();
   if (rec) {
     ctx2d.arc(sx, sy, r, 0, 2 * Math.PI);
@@ -902,11 +951,31 @@ function drawTransport() {
   } else {
     ctx2d.rect(sx - r * 0.82, sy - r * 0.82, r * 1.64, r * 1.64);
   }
-  ctx2d.fill();
-  ctx2d.font = "bold 13px ui-monospace, monospace";
+  if (rec && !live) ctx2d.stroke(); else ctx2d.fill();
+  ctx2d.font = "bold 12px ui-monospace, monospace";
   ctx2d.textAlign = "left";
   ctx2d.textBaseline = "middle";
   ctx2d.fillText(label, sx + r + 11, sy);
+  ctx2d.restore();
+
+  drawMicMeter(x, y + ph + 6, pw);
+}
+
+/* Mic level with the threshold marked, so "too soft" is actionable — you can
+ * see how far under you are rather than just being told no. */
+function drawMicMeter(x, y, w) {
+  if (!audioCtx) return;
+  const h = 8, LO = -9.5, HI = -1.5;            // useful log-RMS range
+  const at = (v) => Math.min(1, Math.max(0, (v - LO) / (HI - LO)));
+  ctx2d.save();
+  ctx2d.fillStyle = "rgba(8,8,16,0.66)";
+  ctx2d.fillRect(x, y, w, h);
+  ctx2d.fillStyle = capturing() ? "#e65c5c" : "rgba(200,200,220,0.45)";
+  ctx2d.fillRect(x, y, at(micLoud) * w, h);
+  if (loudThreshold !== null) {                 // where the room floor put it
+    ctx2d.fillStyle = "#ffffff";
+    ctx2d.fillRect(x + at(loudThreshold) * w - 1, y - 2, 2, h + 4);
+  }
   ctx2d.restore();
 }
 

@@ -38,9 +38,49 @@ print(f"model: {MODEL_NAME}", flush=True)
 # also shouldn't destroy each other, so flipping the toggle in the front end
 # leaves the other space's work intact.
 SPACES = {"xy": 2, "body": 4}
-# How far below a take's own sung level a frame has to be before it counts as
-# "not singing", in log-RMS. 3.0 is about 26 dB down.
-SILENCE_DROP = 3.0
+# Minimum gap in log-RMS (~17 dB) between the quiet and loud halves of a take
+# before we believe they are two different things rather than one performance.
+MIN_SEPARATION = 2.0
+
+
+def voiced_mask(loud):
+    """Which frames of a take were actually sung.
+
+    A take's loudness is two clusters — silence and voice — with a wide gap
+    between them, so the split is found from the take's own distribution
+    rather than any fixed level: no assumption about microphone gain, room
+    noise, or how loudly you sing.
+
+    This replaced "90th percentile minus a margin", which quietly stops
+    working once singing is under a tenth of the take (the reference lands in
+    the silence and everything is kept). Measured on a take that was 11%
+    singing, the percentile rule kept 100% of the silence; this keeps 0%.
+    """
+    n = len(loud)
+    if n < 8:
+        return np.ones(n, bool)
+    lo, hi = float(loud.min()), float(loud.max())
+    if hi - lo < MIN_SEPARATION:                # uniformly loud: nothing to drop
+        return np.ones(n, bool)
+
+    best_v, best_t = -1.0, None                 # Otsu: maximum between-class variance
+    for th in np.linspace(lo, hi, 64)[1:-1]:
+        a, b = loud[loud <= th], loud[loud > th]
+        if len(a) < 2 or len(b) < 2:
+            continue
+        v = len(a) * len(b) * (b.mean() - a.mean()) ** 2
+        if v > best_v:
+            best_v, best_t = v, th
+    if best_t is None:
+        return np.ones(n, bool)
+
+    sung = loud > best_t
+    quiet = ~sung
+    # A take with no silence in it still has a loudest and a quietest half;
+    # without this guard we would throw away the softer half of a performance.
+    if not quiet.any() or (loud[sung].mean() - loud[quiet].mean()) < MIN_SEPARATION:
+        return np.ones(n, bool)
+    return sung
 MAPPERS = {name: KernelMapper(dim=d) for name, d in SPACES.items()}
 LOCK = threading.Lock()
 
@@ -112,7 +152,7 @@ def get_state(space: str = "xy"):
 
 @app.post("/api/take")
 async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(...),
-                    space: str = Form("xy")):
+                    space: str = Form("xy"), loud_threshold: float = Form(None)):
     """audio: raw little-endian float32 mono; cursor: JSON [[t, p_1..p_D],...]
     (D=2 for the mouse pad, D=4 for the full-body features)."""
     raw = await audio.read()
@@ -147,10 +187,21 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
     # the quietest 40% come out ~170x breathier than sung ones, at a thousandth
     # of the amplitude. Storing them means the instrument is quiet and breathy
     # wherever you happened to be standing while not singing, which is most of
-    # the gesture space. The threshold is relative to the take's own level, so
-    # it follows how loudly you sing rather than assuming a microphone gain.
+    # the gesture space.
+    # Prefer the threshold the front end measured from the room during the hold
+    # gesture: it is what the live indicator was showing while you sang, so what
+    # gets dropped is exactly what you were told would be dropped. Fall back to
+    # splitting the take's own distribution when there was no calibration (the
+    # x,y modality has no hold gesture) or when trusting it would leave almost
+    # nothing — a cough during the hold shouldn't cost you the take.
     loud_col = tg[:, 1]
-    keep = loud_col > (np.percentile(loud_col, 90) - SILENCE_DROP)
+    keep = None
+    if loud_threshold is not None:
+        cal = loud_col > float(loud_threshold)
+        if cal.mean() >= 0.15:
+            keep = cal
+    if keep is None:
+        keep = voiced_mask(loud_col)
     dropped = int(len(keep) - keep.sum())
     if keep.sum() >= 6:                         # unless that leaves nothing to fit
         pts, tg = pts[keep], tg[keep]

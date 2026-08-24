@@ -70,6 +70,7 @@ class Instrument extends AudioWorkletProcessor {
     this.queue = new Float32Array(0);
     this.recording = false;
     this.recChunks = [];
+    this._lvlSum = 0; this._lvlN = 0; this._lvlBlocks = 0;   // mic level meter
 
     this.port.onmessage = (e) => this._onMessage(e.data);
     this.port.postMessage({ type: "ready", sampleRate });
@@ -378,8 +379,21 @@ class Instrument extends AudioWorkletProcessor {
 
   // ── audio callback ────────────────────────────────────────────────────────
   process(inputs, outputs) {
-    if (this.recording && inputs[0] && inputs[0][0])
-      this.recChunks.push(Float32Array.from(inputs[0][0]));
+    const mic = inputs[0] && inputs[0][0];
+    // Mic level, always — not just while recording. The front end needs it
+    // before a take starts, to learn the room's noise floor during the hold
+    // gesture and so tell you live whether you are loud enough to be captured.
+    if (mic) {
+      for (let i = 0; i < mic.length; i++) this._lvlSum += mic[i] * mic[i];
+      this._lvlN += mic.length;
+      if (++this._lvlBlocks >= 8) {            // ~15 posts/sec at 128-frame blocks
+        this.port.postMessage({ type: "level",
+                                rms: Math.sqrt(this._lvlSum / this._lvlN) });
+        this._lvlSum = 0; this._lvlN = 0; this._lvlBlocks = 0;
+      }
+    }
+    if (this.recording && mic)
+      this.recChunks.push(Float32Array.from(mic));
 
     const out = outputs[0][0];
     let q = this.queue;
