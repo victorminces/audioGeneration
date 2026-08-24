@@ -65,7 +65,7 @@ def synth_tones(n, clip_samples, rng):
     out = []
     t = np.arange(clip_samples) / ddsp.SR
     for _ in range(n):
-        f0 = float(np.exp(rng.uniform(np.log(400.0), np.log(ddsp.F0_MAX * 0.95))))
+        f0 = float(np.exp(rng.uniform(np.log(400.0), np.log(ddsp.F0_DETECT_MAX * 0.95))))
         drift = f0 * (1 + rng.uniform(-0.25, 0.25) * t / max(t[-1], 1e-9))
         vib = drift * (1 + rng.uniform(0.002, 0.012)
                        * np.sin(2 * np.pi * rng.uniform(3.5, 7.0) * t))
@@ -91,7 +91,7 @@ def build_cache(data_dir, clip_seconds, cache_path, synth_frac=0.0, seed=0):
         rng = np.random.default_rng(seed)
         n = int(round(len(clips) * synth_frac))
         clips += synth_tones(n, clip_samples, rng)
-        print(f"  + {n} synthetic high-pitch clips (400-{ddsp.F0_MAX:.0f} Hz)")
+        print(f"  + {n} synthetic high-pitch clips (400-{ddsp.F0_DETECT_MAX:.0f} Hz)")
 
     wavs, f0s, louds, mels = [], [], [], []
     for wav in clips:
@@ -191,7 +191,7 @@ def train(args):
             "steps": target_step, "steps_done": step_done,
             "batch_size": args.batch_size, "lr": args.lr,
             "clip_seconds": args.clip_seconds, "val_frac": args.val_frac,
-            "f0_min": ddsp.F0_MIN, "f0_max": ddsp.F0_MAX,
+            "f0_min": model.f0_min, "f0_max": model.f0_max,
             "synth_frac": args.synth_frac,
             "clips_used": n, "loss_history": loss_history,
             "note": f"DDSP harmonic+noise, timbre z={ddsp.Z_DIM}, trained via train_ddsp.py"

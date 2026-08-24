@@ -133,12 +133,17 @@ def decoder_manifest():
     return {
         "tensors": _manifest,
         "total": _off,
-        # F0_MIN/MAX come from the loaded checkpoint, not the module defaults:
-        # the worklet must scale f0 exactly the way these weights were trained
+        # Two ranges, and the worklet needs both. SCALE is how these particular
+        # weights read their f0 input, so it comes from the checkpoint. PLAY is
+        # how high the oscillator may go, which is the analyser's reach — the
+        # decoder extrapolates past its scale cleanly, so clamping playback to
+        # the training range would throw away pitches we can measure.
         "constants": {"SR": ddsp.SR, "HOP": ddsp.HOP,
                       "N_HARMONICS": ddsp.N_HARMONICS,
                       "N_NOISE": ddsp.N_NOISE, "Z_DIM": ddsp.Z_DIM,
-                      "F0_MIN": MODEL.f0_min, "F0_MAX": MODEL.f0_max},
+                      "F0_SCALE_MIN": MODEL.f0_min, "F0_SCALE_MAX": MODEL.f0_max,
+                      "F0_PLAY_MIN": ddsp.F0_DETECT_MIN,
+                      "F0_PLAY_MAX": ddsp.F0_DETECT_MAX},
     }
 
 

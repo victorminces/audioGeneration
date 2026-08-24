@@ -21,24 +21,32 @@ N_NOISE     = 65             # noise filter bands
 Z_DIM       = 16
 N_MELS      = 80
 
-# Pitch range the model is trained over. 60-600 was speech-shaped: LibriSpeech
-# f0 sits around 80-300 Hz. 2000 is the ceiling of the detector rather than a
-# choice — torchcrepe is a classifier over 360 bins of 20 cents from C1
-# (32.7 Hz), which is six octaves and stops at 2092 Hz, with MAX_FMAX = 2006.
-# Ask for more and it can only answer with a subharmonic.
+# Two different ranges, easily confused.
 #
-# The scaling below is baked into a trained model's weights, so a checkpoint
-# carries the range it was trained with (see train_ddsp.py / load_latest_ddsp)
-# and these are only the defaults for a fresh one.
-F0_MIN = 60.0
-F0_MAX = 2000.0
+# DETECT is what the analyser can measure. Its ceiling is torchcrepe's, not a
+# preference: CREPE is a classifier over 360 bins of 20 cents from C1, six
+# octaves ending at 2092 Hz, with MAX_FMAX = 2006. Above that it can only
+# answer with a subharmonic.
+#
+# SCALE is how a trained decoder reads its f0 input, and is baked into the
+# weights — a checkpoint carries the one it was trained with. It stays at
+# 60-600 because that is where the resolution should be: it gives 0.30 of
+# input per octave rather than 0.20, and pitches above it simply scale past
+# 1.0, which the decoder extrapolates through cleanly (measured: 1500 Hz in,
+# 1500 Hz out, at the same level as an in-range pitch). Widening SCALE to
+# match DETECT would only spend resolution to avoid an extrapolation that
+# already works.
+F0_DETECT_MIN = 60.0
+F0_DETECT_MAX = 2000.0
+F0_SCALE_MIN = 60.0
+F0_SCALE_MAX = 600.0
 
 _mel = T.MelSpectrogram(sample_rate=SR, n_fft=1024, hop_length=HOP, n_mels=N_MELS)
 
 
 # ── analysis ──────────────────────────────────────────────────────────────────
 
-def extract_f0(wav, n_frames, f0_min=F0_MIN, f0_max=F0_MAX):
+def extract_f0(wav, n_frames, f0_min=F0_DETECT_MIN, f0_max=F0_DETECT_MAX):
     """(1, samples) -> (n_frames,) f0 in Hz (unvoiced frames get held/low values;
     the decoder learns to silence harmonics there via the amplitude head)."""
     # weighted_argmax decoder is pure torch (the default viterbi decoder pulls
@@ -66,7 +74,7 @@ def mel_frames(wav, n_frames):
                          mode="linear", align_corners=True)[0].T
 
 
-def scale_f0(f0, f0_min=F0_MIN, f0_max=F0_MAX):
+def scale_f0(f0, f0_min=F0_SCALE_MIN, f0_max=F0_SCALE_MAX):
     """Hz -> ~[0, 1] over the model's trained pitch range."""
     lo = float(np.log2(f0_min))
     return (f0.clamp(min=1).log2() - lo) / float(np.log2(f0_max / f0_min))
@@ -121,7 +129,7 @@ class Decoder(nn.Module):
 
 
 class DDSP(nn.Module):
-    def __init__(self, f0_min=F0_MIN, f0_max=F0_MAX):
+    def __init__(self, f0_min=F0_SCALE_MIN, f0_max=F0_SCALE_MAX):
         super().__init__()
         self.encoder = TimbreEncoder()
         self.decoder = Decoder()
@@ -197,7 +205,7 @@ def multiscale_spectral_loss(x, y):
 def analyze(model, wav):
     """(1, samples) -> dict of per-frame params (f0 Hz, loud, z)."""
     n_frames = wav.shape[1] // HOP
-    f0   = extract_f0(wav, n_frames, model.f0_min, model.f0_max)
+    f0   = extract_f0(wav, n_frames)          # measure as high as we can see
     loud = extract_loudness(wav, n_frames)
     mels = mel_frames(wav, n_frames)
     with torch.no_grad():

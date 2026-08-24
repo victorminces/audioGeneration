@@ -30,13 +30,16 @@ class Instrument extends AudioWorkletProcessor {
       this.T[t.name] = { d: all.subarray(t.offset, t.offset + n), shape: t.shape };
     }
 
-    // pitch range the loaded checkpoint was trained on — its weights read f0
-    // on this scale, so an older 60-600 model stays in tune rather than being
-    // transposed by whatever today's default happens to be
-    this.f0Min = this.C.F0_MIN || 60;
-    this.f0Max = this.C.F0_MAX || 600;
-    this.f0Lo = Math.log2(this.f0Min);
-    this.f0Span = Math.log2(this.f0Max / this.f0Min);
+    // How the checkpoint's weights read f0 (baked in at training) versus how
+    // high the oscillator may actually run. They differ on purpose: the
+    // decoder extrapolates past its training range cleanly, so playback is
+    // limited by what the analyser can measure, not by what it was trained on.
+    this.f0ScaleMin = this.C.F0_SCALE_MIN || this.C.F0_MIN || 60;
+    this.f0ScaleMax = this.C.F0_SCALE_MAX || this.C.F0_MAX || 600;
+    this.f0Lo = Math.log2(this.f0ScaleMin);
+    this.f0Span = Math.log2(this.f0ScaleMax / this.f0ScaleMin);
+    this.f0PlayMin = this.C.F0_PLAY_MIN || 60;
+    this.f0PlayMax = this.C.F0_PLAY_MAX || this.f0ScaleMax;
 
     this.hop = Math.round(this.C.HOP * sampleRate / MODEL_SR);
     this.noiseFFT = 1 << Math.ceil(Math.log2(2 * this.hop));   // 512 at 16 kHz
@@ -273,7 +276,7 @@ class Instrument extends AudioWorkletProcessor {
 
     const p = this._p;
     const conf = this.predict(p);
-    const f0 = Math.min(this.f0Max, Math.max(this.f0Min, Math.exp(p[0])));
+    const f0 = Math.min(this.f0PlayMax, Math.max(this.f0PlayMin, Math.exp(p[0])));
     const amp = this.decodeFrame(f0, p[1], p.subarray(2));
     const harm = this._harm, H = this.C.N_HARMONICS;
 
