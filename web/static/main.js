@@ -32,6 +32,12 @@ const PAD_FEATURES = [
 // paths here, so switching back and forth never destroys the other's work.
 const SPACE_FEATURES = { xy: PAD_FEATURES, body: BODY_FEATURES };
 let space = "xy";               // "xy" | "body"
+// Which synthesis method is playing. Both decoders are resident in the
+// worklet and both timbre codes are stored in every map row, so this switches
+// instantly and on identical demonstrations — an A/B of methods, not of takes.
+//   "amp"     decoder predicts all 60 harmonic amplitudes directly
+//   "filter"  decoder predicts a spectral envelope, sampled at k*f0
+let harmMode = "amp";
 let features = PAD_FEATURES;    // whichever space is currently driving the map
 const GDIM = () => features.length;
 const demoPathsBy = { xy: [], body: [] };
@@ -123,6 +129,26 @@ spaceBtn.addEventListener("click", async () => {
   if (space === "body" && !camOn) setStatus("whole body needs the camera — turn it on");
 });
 
+// ── synthesis method A/B ────────────────────────────────────────────────────
+const HARM_LABEL = { amp: "synth: harmonics", filter: "synth: filter" };
+const harmBtn = document.getElementById("harm");
+
+function syncHarmBtn() {
+  harmBtn.textContent = HARM_LABEL[harmMode];
+  harmBtn.title = harmMode === "amp"
+    ? "the decoder predicts each harmonic's amplitude directly (pitch-relative)"
+    : "the decoder predicts a spectral envelope on absolute frequency and the "
+      + "harmonics are read off it at k*f0 (source-filter: formants stay put "
+      + "as the pitch moves)";
+}
+
+harmBtn.addEventListener("click", () => {
+  harmMode = harmMode === "amp" ? "filter" : "amp";
+  syncHarmBtn();
+  if (node) node.port.postMessage({ type: "model", mode: harmMode });
+});
+syncHarmBtn();
+
 let configBusy = false;
 async function postConfig(fields) {
   if (configBusy) return;
@@ -157,21 +183,28 @@ sigpEl.addEventListener("change", () => postConfig({ sigma_par: sigpEl.value }))
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   setStatus("loading decoder…");
-  const [manifest, weightsBuf, st] = await Promise.all([
+  const [manifest, st] = await Promise.all([
     fetch("/api/decoder/manifest").then(r => r.json()),
-    fetch("/api/decoder/weights").then(r => r.arrayBuffer()),
     fetch(`/api/state?space=${space}`).then(r => r.json()),
   ]);
+  // Both decoders are fetched up front and both live in the worklet, so
+  // switching synthesis method later is a pointer change and not a reload —
+  // you can A/B mid-phrase without the audio dropping out.
+  const weights = {};
+  await Promise.all(manifest.modes.map(async (m) => {
+    weights[m] = await fetch(`/api/decoder/weights?model=${m}`).then(r => r.arrayBuffer());
+  }));
   state = st;
   pos = new Array(GDIM()).fill(0.5);
 
   audioCtx = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
   // cache-bust: addModule ignores hard-refresh, so pin the worklet version
-  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=10");
+  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=12");
   node = new AudioWorkletNode(audioCtx, "instrument", {
     numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
-    processorOptions: { manifest, weights: weightsBuf, constants: manifest.constants },
+    processorOptions: { manifest, weights, constants: manifest.constants },
   });
+  node.port.postMessage({ type: "model", mode: harmMode });
   node.port.onmessage = (e) => onWorklet(e.data);
   node.connect(audioCtx.destination);
 
@@ -229,11 +262,20 @@ function trackFloor(v) {
 const micFloor = () => (roomFloor !== null ? roomFloor : floorTracked);
 const micThreshold = () => micFloor() + floorMargin;
 
+// How much of the current take was actually above the threshold. The server
+// crops to that span before analysing, so it — not the length of the
+// recording — is what the wait afterwards will be proportional to.
+let takeVoicedS = 0, lastLevelT = 0;
+
 function onWorklet(m) {
   if (m.type === "level") {
     micLoud = Math.log(m.rms + 1e-5);          // matches ddsp.extract_loudness
     trackFloor(micLoud);
     if (holdSince) calSamples.push(micLoud);   // hands together = room only
+    const now = performance.now();
+    if (mode === "demo" && lastLevelT && capturing())
+      takeVoicedS += Math.min(0.5, (now - lastLevelT) / 1000);
+    lastLevelT = now;
   } else if (m.type === "take") {
     uploadTake(new Float32Array(m.audio));
   }
@@ -264,6 +306,33 @@ gateEl.addEventListener("input", () => {
 });
 
 // ── takes ────────────────────────────────────────────────────────────────────
+/* The gap between stopping and the instrument responding.
+ *
+ * Analysing a take is not instant — pitch tracking dominates, and it now runs
+ * a timbre encoder per synthesis method on top. Measured on this machine at
+ * roughly 100 ms of server time per second of *analysed* audio (93 ms/s at
+ * 30s, 97 at 60s, 108 at 120s).
+ *
+ * Analysed, not recorded: the server crops to the sung span first, so what
+ * counts is how long you sang, not how long the recording ran. Estimating from
+ * the recording would be wildly pessimistic in body mode, where a two-second
+ * phrase can sit inside a minutes-long take.
+ *
+ * The wait lands exactly when you have stepped back from the screen with your
+ * hands still up, which is the worst moment to be reading a status line — so
+ * it gets the same unmissable treatment as recording.
+ */
+const ANALYSE_MS_PER_S = 100;
+let analysing = null;                   // {t0, estMs} while a take is in flight
+
+// Eases toward 1 but never reaches it while still waiting: a bar that fills
+// completely and then keeps you waiting is worse than one that visibly slows.
+function analyseProgress() {
+  if (!analysing) return 0;
+  const x = (performance.now() - analysing.t0) / analysing.estMs;
+  return 1 - Math.exp(-1.6 * Math.max(x, 0)) * (1 - 0.02);
+}
+
 async function uploadTake(audio) {
   const cur = pendingCursor || [];
   pendingCursor = null;
@@ -271,7 +340,12 @@ async function uploadTake(audio) {
     setStatus("take too short — hold longer and sing");
     return;
   }
-  setStatus("analyzing take…");
+  const secs = audio.length / audioCtx.sampleRate;
+  // + 0.5 for the margin the server keeps around the sung span
+  const willAnalyse = Math.min(secs, takeVoicedS + 0.5);
+  analysing = { t0: performance.now(),
+                estMs: Math.max(400, willAnalyse * ANALYSE_MS_PER_S) };
+  setStatus(`analyzing ${willAnalyse.toFixed(1)}s sung of ${secs.toFixed(1)}s…`);
   const fd = new FormData();
   fd.append("audio", new Blob([audio.buffer], { type: "application/octet-stream" }));
   fd.append("cursor", JSON.stringify(cur));
@@ -296,6 +370,7 @@ async function uploadTake(audio) {
   } catch (err) {
     setStatus("server error: " + err.message);
   }
+  analysing = null;
   hud();
 }
 
@@ -327,6 +402,7 @@ function startTake(kind, byCam) {
   mode = kind;
   if (kind === "demo") {
     livePath = [pos.slice()];
+    takeVoicedS = 0; lastLevelT = 0;
     node.port.postMessage({ type: "record", on: true });
     setStatus("RECORDING — sing and move…");
   } else {
@@ -897,6 +973,30 @@ function drawHoldProgress() {
  * be in by accident. */
 function drawModeBanner() {
   const w = canvas.width, h = canvas.height;
+  if (analysing) {
+    const p = analyseProgress();
+    ctx2d.save();
+    ctx2d.strokeStyle = "rgba(106,169,224,0.9)";
+    ctx2d.lineWidth = 8;
+    ctx2d.strokeRect(4, 4, w - 8, h - 8);
+    const label = "LEARNING YOUR TAKE";
+    ctx2d.font = "bold 20px ui-monospace, monospace";
+    ctx2d.textAlign = "center";
+    ctx2d.textBaseline = "middle";
+    const tw = ctx2d.measureText(label).width;
+    const bx = w / 2 - tw / 2 - 14, bw = tw + 28;
+    ctx2d.fillStyle = "rgba(106,169,224,0.9)";
+    ctx2d.fillRect(bx, h - 54, bw, 32);
+    ctx2d.fillStyle = "#0b0b14";
+    ctx2d.fillText(label, w / 2, h - 38);
+    // the same estimate as the transport ring, as a bar under the label
+    ctx2d.fillStyle = "rgba(11,11,20,0.5)";
+    ctx2d.fillRect(bx, h - 20, bw, 5);
+    ctx2d.fillStyle = "rgba(106,169,224,0.95)";
+    ctx2d.fillRect(bx, h - 20, bw * p, 5);
+    ctx2d.restore();
+    return;
+  }
   const rec = mode === "demo", play = mode === "trace";
   if (!rec && !play) {
     if (space === "body" && !holdSince) {
@@ -939,13 +1039,18 @@ function drawModeBanner() {
  * Shapes rather than glyphs — no font dependency, and crisp at any size. */
 function drawTransport() {
   const pw = 132, ph = 34, x = canvas.width - pw - 12, y = 12;
-  const rec = mode === "demo", play = mode === "trace";
+  // Analysing outranks the others: the take is over, so what the transport was
+  // showing is no longer what the instrument is doing.
+  const busy = !!analysing;
+  const rec = !busy && mode === "demo", play = !busy && mode === "trace";
   // While recording, red only means "this is going into the map". Below the
   // threshold the take is still running but nothing is being learned, so it
   // goes hollow and amber rather than lying to you with a solid red dot.
   const live = rec && capturing();
-  const color = rec ? (live ? "#e65c5c" : "#c8912f") : play ? "#5ac882" : "#9696aa";
-  const label = rec ? (live ? "REC" : "too soft") : play ? "PLAY" : "STOP";
+  const color = busy ? "#6aa9e0"
+              : rec ? (live ? "#e65c5c" : "#c8912f") : play ? "#5ac882" : "#9696aa";
+  const label = busy ? "LEARNING"
+              : rec ? (live ? "REC" : "too soft") : play ? "PLAY" : "STOP";
   const sx = x + 22, sy = y + ph / 2, r = 9;
 
   ctx2d.save();
@@ -955,18 +1060,33 @@ function drawTransport() {
     ? 0.6 + 0.4 * Math.abs(Math.sin(performance.now() / 380)) : 1;
   ctx2d.strokeStyle = ctx2d.fillStyle = color;
   ctx2d.lineWidth = 2.5;
-  ctx2d.beginPath();
-  if (rec) {
+  if (busy) {
+    // a ring that fills clockwise from the top, so the wait has a visible end
+    ctx2d.globalAlpha = 0.35;
+    ctx2d.beginPath();
     ctx2d.arc(sx, sy, r, 0, 2 * Math.PI);
-  } else if (play) {
-    ctx2d.moveTo(sx - r * 0.75, sy - r);
-    ctx2d.lineTo(sx + r, sy);
-    ctx2d.lineTo(sx - r * 0.75, sy + r);
+    ctx2d.stroke();
+    ctx2d.globalAlpha = 1;
+    ctx2d.beginPath();
+    ctx2d.moveTo(sx, sy);
+    ctx2d.arc(sx, sy, r - 1.5, -Math.PI / 2,
+              -Math.PI / 2 + 2 * Math.PI * analyseProgress());
     ctx2d.closePath();
+    ctx2d.fill();
   } else {
-    ctx2d.rect(sx - r * 0.82, sy - r * 0.82, r * 1.64, r * 1.64);
+    ctx2d.beginPath();
+    if (rec) {
+      ctx2d.arc(sx, sy, r, 0, 2 * Math.PI);
+    } else if (play) {
+      ctx2d.moveTo(sx - r * 0.75, sy - r);
+      ctx2d.lineTo(sx + r, sy);
+      ctx2d.lineTo(sx - r * 0.75, sy + r);
+      ctx2d.closePath();
+    } else {
+      ctx2d.rect(sx - r * 0.82, sy - r * 0.82, r * 1.64, r * 1.64);
+    }
+    if (rec && !live) ctx2d.stroke(); else ctx2d.fill();
   }
-  if (rec && !live) ctx2d.stroke(); else ctx2d.fill();
   ctx2d.font = "bold 12px ui-monospace, monospace";
   ctx2d.textAlign = "left";
   ctx2d.textBaseline = "middle";
@@ -1032,9 +1152,11 @@ function draw() {
 
   drawFeatureBars();
   drawTransport();
-  if (camOn) {
+  // the analysing banner is not camera-gated: the wait happens in both
+  // modalities, and the mouse pad has no other sign that anything is happening
+  if (camOn || analysing) {
     drawModeBanner();
-    if (space === "body") drawHoldProgress();
+    if (camOn && space === "body") drawHoldProgress();
   }
   requestAnimationFrame(draw);
 }

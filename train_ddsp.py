@@ -158,14 +158,104 @@ def build_cache(data_dir, clip_seconds, cache_path, synth_frac=0.0, seed=0):
 
 
 class ClipDataset(Dataset):
-    def __init__(self, wav, f0, loud, mel):
-        self.wav, self.f0, self.loud, self.mel = wav, f0, loud, mel
+    def __init__(self, wav, f0, rel, mel):
+        self.wav, self.f0, self.rel, self.mel = wav, f0, rel, mel
 
     def __len__(self):
         return len(self.wav)
 
     def __getitem__(self, i):
-        return self.wav[i], self.f0[i], self.loud[i], self.mel[i]
+        return self.wav[i], self.f0[i], self.rel[i], self.mel[i]
+
+
+def derive_features(wav):
+    """Cached waveforms -> (loudness, log-mel), recomputed rather than trusted.
+
+    `wav` and `f0` are what the cache exists for: crepe is nearly all of the
+    build time. Loudness and log-mel are two cheap transforms, so deriving them
+    on load costs seconds and means they can never drift out of step with
+    ddsp.py — which they silently did when the analysis floors changed from
+    absolute to relative, and would have again on any future change.
+
+    Written into preallocated tensors rather than accumulated in lists: this
+    machine runs the training with about 2 GB free, and a list of 2419 tensors
+    plus the stack that doubles it was enough to segfault the process.
+    """
+    n = len(wav)
+    n_frames = wav.shape[1] // ddsp.HOP
+    loud = torch.empty(n, n_frames)
+    mel = torch.empty(n, n_frames, ddsp.N_MELS)
+    for i in range(n):
+        w = wav[i].unsqueeze(0)
+        loud[i] = ddsp.extract_loudness(w, n_frames)
+        mel[i] = ddsp.mel_frames(w, n_frames)
+    return loud, mel
+
+
+def adapt_checkpoint(model, old_pt, device):
+    """Warm-start the factored model from a checkpoint that still took loudness.
+
+    The old decoder computed W @ [f0, loud, z] + b. Deleting the loudness column
+    is the same as pinning `loud` to a constant, and which constant is ours to
+    pick: folding W[:, i_loud] * scale_loud(REF_LOUD) into the bias makes the
+    17-input decoder exactly the old 18-input one held at normal singing level.
+    Not an approximation — the same function. (A plain column drop would pin it
+    at 0 in scaled units, i.e. log-RMS -8, the near-silence operating point
+    where the old model already misbehaved.)
+
+    Everything else transfers unchanged except head_amp, which is deleted
+    because level is no longer predicted, and head_mix, which is new: nothing in
+    the old model corresponds to it, so it starts at a constant mostly-harmonic
+    balance and learns from there.
+    """
+    old = torch.load(old_pt, map_location=device, weights_only=True)
+    new = model.state_dict()
+    scaled_ref = (ddsp.REF_LOUD + 8.0) / 8.0        # the old module's scale_loud
+    OLD_IN_DIM, I_LOUD = 2 + ddsp.Z_DIM, 1          # x was [f0, loud, z...]
+    kept, folded, fresh = [], [], []
+
+    for k, v in new.items():
+        if k not in old:
+            fresh.append(k)
+            continue
+        o = old[k]
+        if o.shape == v.shape:
+            new[k] = o
+            kept.append(k)
+        elif o.dim() == 2 and o.shape[0] == v.shape[0] and o.shape[1] == v.shape[1] + 1:
+            # x is the trailing block of the input: it is the whole input for
+            # mlp_in.0, and the last OLD_IN_DIM columns of cat([h, x]) for
+            # mlp_out.0. So the loudness column is always this far in.
+            col = o.shape[1] - OLD_IN_DIM + I_LOUD
+            bias_key = k.replace(".weight", ".bias")
+            new[k] = torch.cat([o[:, :col], o[:, col + 1:]], dim=1)
+            if bias_key in new and bias_key in old:
+                new[bias_key] = old[bias_key] + o[:, col] * scaled_ref
+            folded.append(f"{k} col {col}")
+        else:
+            fresh.append(f"{k} (shape {tuple(o.shape)} -> {tuple(v.shape)})")
+
+    if "decoder.head_mix.weight" in new:
+        new["decoder.head_mix.weight"] = torch.zeros_like(new["decoder.head_mix.weight"])
+        new["decoder.head_mix.bias"] = torch.full_like(
+            new["decoder.head_mix.bias"], -2.197)     # sigmoid -> 0.10 noise
+    if "decoder.head_env.weight" in new:
+        # A filter-mode model cannot inherit head_harm: that is indexed by
+        # harmonic number and this by frequency, and no fixed map between them
+        # exists without knowing f0. So it starts from a plausible spectrum
+        # instead of noise — falling about 5 dB per octave, roughly what a
+        # voiced source does. Worth remembering when comparing the two modes:
+        # the amplitude model inherits a *trained* head here and this one does
+        # not, which flatters the amplitude model early in a run.
+        new["decoder.head_env.weight"] = torch.zeros_like(new["decoder.head_env.weight"])
+        tilt = torch.logspace(0, -2, ddsp.N_ENV)      # 1.0 down to 0.01
+        new["decoder.head_env.bias"] = torch.logit(
+            (tilt / 2.0) ** (1 / 2.3)).to(new["decoder.head_env.bias"].dtype)
+    model.load_state_dict(new)
+    dropped = [k for k in old if k not in new]
+    print(f"  adapted: {len(kept)} tensors copied, {len(folded)} folded "
+          f"({', '.join(folded)}), {len(fresh)} fresh ({', '.join(fresh)})")
+    print(f"  dropped from the old checkpoint: {', '.join(dropped) or 'none'}")
 
 
 def _next_name():
@@ -186,16 +276,34 @@ def train(args):
         append_tones(cache_path, args.append_tones, args.clip_seconds,
                      args.append_air_max, args.append_f_lo, args.seed + 1)
 
-    data = np.load(cache_path)
-    wav, f0, loud, mel = (torch.from_numpy(data[k]) for k in ("wav", "f0", "loud", "mel"))
+    with np.load(cache_path) as data:
+        wav = torch.from_numpy(data["wav"])   # ~310 MB; everything below is
+        f0 = torch.from_numpy(data["f0"])     # careful not to copy it again
     n = len(wav)
+    print(f"deriving loudness and log-mel for {n} clips...", flush=True)
+    loud, mel = derive_features(wav)
+
+    # Train on level-normalised clips. Every clip is scaled to the same
+    # performed level and the resulting per-frame RMS is handed to the model
+    # directly, so the level term of the loss is matched by construction and
+    # what is left to reduce is spectral shape. Note this makes val losses
+    # incomparable with ddsp_001..005, which were scored on absolute level too.
+    ref = ddsp.take_level(loud)                             # (n,)
+    rel = loud - ref[:, None]                               # (n, T)
+    wav.mul_(torch.exp(ddsp.REF_LOUD - ref)[:, None])       # in place: see above
+    print(f"  performed level p5 {np.percentile(ref, 5):+.2f}  "
+          f"p50 {np.percentile(ref, 50):+.2f}  p95 {np.percentile(ref, 95):+.2f}"
+          f"  -> all normalised to {ddsp.REF_LOUD:+.2f}", flush=True)
 
     n_val = max(1, int(n * args.val_frac))
-    perm = torch.randperm(n)
+    # Seeded so the split is the same on every run. Without this, two runs over
+    # the same cache validate against different clips and their val losses are
+    # not comparable — including a run and its own --resume continuation.
+    perm = torch.randperm(n, generator=torch.Generator().manual_seed(args.seed))
     val_idx, train_idx = perm[:n_val], perm[n_val:]
 
-    train_ds = ClipDataset(wav[train_idx], f0[train_idx], loud[train_idx], mel[train_idx])
-    val_ds = ClipDataset(wav[val_idx], f0[val_idx], loud[val_idx], mel[val_idx])
+    train_ds = ClipDataset(wav[train_idx], f0[train_idx], rel[train_idx], mel[train_idx])
+    val_ds = ClipDataset(wav[val_idx], f0[val_idx], rel[val_idx], mel[val_idx])
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               drop_last=len(train_idx) >= args.batch_size)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
@@ -220,12 +328,20 @@ def train(args):
         f0_min = float(prev_cfg.get("f0_min", 60.0))
         f0_max = float(prev_cfg.get("f0_max", 600.0))
 
-    model = ddsp.DDSP(f0_min=f0_min, f0_max=f0_max).to(device)
+    harm_mode = (prev_cfg or {}).get("harm_mode", args.harm_mode)
+    model = ddsp.DDSP(f0_min=f0_min, f0_max=f0_max, harm_mode=harm_mode).to(device)
+    print(f"harmonic mode: {harm_mode}"
+          + ("  (direct per-harmonic amplitudes)" if harm_mode == "amp" else
+             "  (spectral envelope sampled at k*f0)"))
     if args.resume:
         resume_pt = os.path.join(CHECKPOINT_DIR, f"{args.resume}.pt")
         model.load_state_dict(torch.load(resume_pt, map_location=device))
         print(f"Resuming from {args.resume} at step {start_step} "
               f"(f0 scale {f0_min:.0f}-{f0_max:.0f} Hz, from its config)")
+    elif args.adapt:
+        adapt_pt = os.path.join(CHECKPOINT_DIR, f"{args.adapt}.pt")
+        print(f"Warm-starting from pre-factoring checkpoint {args.adapt}:")
+        adapt_checkpoint(model, adapt_pt, device)
 
     target_step = start_step + args.steps
 
@@ -242,12 +358,13 @@ def train(args):
         torch.save(model.state_dict(), pt_path)
         cfg = {
             "name": name, "filename": f"{name}.pt",
-            "domain": "ddsp", "model_type": "ddsp", "arch": "ddsp",
+            "domain": "ddsp", "model_type": "ddsp", "arch": ddsp.ARCH,
             "latent_ch": ddsp.Z_DIM, "latent_units": ddsp.Z_DIM,
             "steps": target_step, "steps_done": step_done,
             "batch_size": args.batch_size, "lr": args.lr,
             "clip_seconds": args.clip_seconds, "val_frac": args.val_frac,
             "f0_min": model.f0_min, "f0_max": model.f0_max,
+            "harm_mode": model.harm_mode,
             "synth_frac": args.synth_frac,
             "clips_used": n, "loss_history": loss_history,
             "note": f"DDSP harmonic+noise, timbre z={ddsp.Z_DIM}, trained via train_ddsp.py"
@@ -263,12 +380,12 @@ def train(args):
 
     while step < target_step:
         model.train()
-        for wav_b, f0_b, loud_b, mel_b in train_loader:
+        for wav_b, f0_b, rel_b, mel_b in train_loader:
             if step >= target_step:
                 break
-            wav_b, f0_b, loud_b, mel_b = (t.to(device) for t in (wav_b, f0_b, loud_b, mel_b))
+            wav_b, f0_b, rel_b, mel_b = (t.to(device) for t in (wav_b, f0_b, rel_b, mel_b))
 
-            recon = model(mel_b, f0_b, loud_b)
+            recon = model(mel_b, f0_b, ddsp.level_to_amp(rel_b))
             loss = ddsp.multiscale_spectral_loss(recon, wav_b)
             recon_loss_val = loss.item()
 
@@ -282,10 +399,10 @@ def train(args):
                 model.eval()
                 with torch.no_grad():
                     v_losses = []
-                    for wav_v, f0_v, loud_v, mel_v in val_loader:
-                        wav_v, f0_v, loud_v, mel_v = (t.to(device)
-                                                      for t in (wav_v, f0_v, loud_v, mel_v))
-                        v_recon = model(mel_v, f0_v, loud_v)
+                    for wav_v, f0_v, rel_v, mel_v in val_loader:
+                        wav_v, f0_v, rel_v, mel_v = (t.to(device)
+                                                     for t in (wav_v, f0_v, rel_v, mel_v))
+                        v_recon = model(mel_v, f0_v, ddsp.level_to_amp(rel_v))
                         v_losses.append(ddsp.multiscale_spectral_loss(v_recon, wav_v).item())
                 val_loss = sum(v_losses) / len(v_losses)
                 model.train()
@@ -333,6 +450,18 @@ def main():
     parser.add_argument("--resume", default=None,
                         help="Existing checkpoint name to continue training from "
                              "(e.g. ddsp_003)")
+    parser.add_argument("--harm-mode", default="amp", choices=list(ddsp.HARM_MODES),
+                        help="How harmonic amplitudes are produced. 'amp': the "
+                             "decoder predicts all 60 directly. 'filter': it "
+                             "predicts a spectral envelope on absolute "
+                             "frequency and they are read off it at k*f0 "
+                             "(source-filter). Ignored with --resume, which "
+                             "takes the mode from the checkpoint.")
+    parser.add_argument("--adapt", default=None,
+                        help="Warm-start from a pre-factoring checkpoint (e.g. "
+                             "ddsp_004): fold its loudness input into the biases "
+                             "at the reference level and keep everything else. "
+                             "Use --resume for checkpoints of this architecture.")
     args = parser.parse_args()
     train(args)
 

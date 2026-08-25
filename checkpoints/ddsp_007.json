@@ -1,0 +1,428 @@
+{
+  "name": "ddsp_007",
+  "filename": "ddsp_007.pt",
+  "domain": "ddsp",
+  "model_type": "ddsp",
+  "arch": "ddsp-factored-v1",
+  "latent_ch": 16,
+  "latent_units": 16,
+  "steps": 2900,
+  "steps_done": 2900,
+  "batch_size": 4,
+  "lr": 0.001,
+  "clip_seconds": 2.0,
+  "val_frac": 0.1,
+  "f0_min": 60.0,
+  "f0_max": 600.0,
+  "harm_mode": "filter",
+  "synth_frac": 0.3,
+  "clips_used": 2419,
+  "loss_history": [
+    {
+      "step": 10,
+      "recon": 1.66486,
+      "val_recon": 1.60258
+    },
+    {
+      "step": 20,
+      "recon": 1.27956,
+      "val_recon": 1.38995
+    },
+    {
+      "step": 30,
+      "recon": 1.67556,
+      "val_recon": 1.44213
+    },
+    {
+      "step": 40,
+      "recon": 1.22227,
+      "val_recon": 1.29234
+    },
+    {
+      "step": 50,
+      "recon": 1.4475,
+      "val_recon": 1.25444
+    },
+    {
+      "step": 60,
+      "recon": 1.22315,
+      "val_recon": 1.19778
+    },
+    {
+      "step": 70,
+      "recon": 1.37951,
+      "val_recon": 1.40326
+    },
+    {
+      "step": 80,
+      "recon": 1.38524,
+      "val_recon": 1.30786
+    },
+    {
+      "step": 90,
+      "recon": 1.1496,
+      "val_recon": 1.18222
+    },
+    {
+      "step": 100,
+      "recon": 1.07314,
+      "val_recon": 1.15044
+    },
+    {
+      "step": 110,
+      "recon": 1.2593,
+      "val_recon": 1.14053
+    },
+    {
+      "step": 120,
+      "recon": 1.33847,
+      "val_recon": 1.15608
+    },
+    {
+      "step": 130,
+      "recon": 1.17504,
+      "val_recon": 1.12631
+    },
+    {
+      "step": 140,
+      "recon": 1.21912,
+      "val_recon": 1.15843
+    },
+    {
+      "step": 150,
+      "recon": 1.29698,
+      "val_recon": 1.29686
+    },
+    {
+      "step": 160,
+      "recon": 1.28413,
+      "val_recon": 1.14467
+    },
+    {
+      "step": 170,
+      "recon": 0.98588,
+      "val_recon": 1.08366
+    },
+    {
+      "step": 180,
+      "recon": 1.07043,
+      "val_recon": 1.08477
+    },
+    {
+      "step": 190,
+      "recon": 0.94297,
+      "val_recon": 1.07163
+    },
+    {
+      "step": 200,
+      "recon": 1.12573,
+      "val_recon": 1.11652
+    },
+    {
+      "step": 210,
+      "recon": 1.13249,
+      "val_recon": 1.07761
+    },
+    {
+      "step": 220,
+      "recon": 1.06912,
+      "val_recon": 1.04348
+    },
+    {
+      "step": 230,
+      "recon": 1.05663,
+      "val_recon": 1.04104
+    },
+    {
+      "step": 240,
+      "recon": 0.88322,
+      "val_recon": 1.03142
+    },
+    {
+      "step": 250,
+      "recon": 1.00772,
+      "val_recon": 1.02732
+    },
+    {
+      "step": 260,
+      "recon": 0.95774,
+      "val_recon": 1.02416
+    },
+    {
+      "step": 270,
+      "recon": 1.08877,
+      "val_recon": 1.0153
+    },
+    {
+      "step": 280,
+      "recon": 0.97383,
+      "val_recon": 1.01963
+    },
+    {
+      "step": 290,
+      "recon": 1.13542,
+      "val_recon": 1.01085
+    },
+    {
+      "step": 300,
+      "recon": 0.99434,
+      "val_recon": 1.01587
+    },
+    {
+      "step": 310,
+      "recon": 1.01143,
+      "val_recon": 1.01065
+    },
+    {
+      "step": 320,
+      "recon": 1.06766,
+      "val_recon": 1.0111
+    },
+    {
+      "step": 330,
+      "recon": 1.02305,
+      "val_recon": 1.00881
+    },
+    {
+      "step": 340,
+      "recon": 0.99872,
+      "val_recon": 1.01038
+    },
+    {
+      "step": 350,
+      "recon": 1.05403,
+      "val_recon": 1.00794
+    },
+    {
+      "step": 360,
+      "recon": 1.06304,
+      "val_recon": 1.0051
+    },
+    {
+      "step": 370,
+      "recon": 0.98427,
+      "val_recon": 1.00307
+    },
+    {
+      "step": 380,
+      "recon": 1.02128,
+      "val_recon": 1.00217
+    },
+    {
+      "step": 390,
+      "recon": 1.04558,
+      "val_recon": 1.00199
+    },
+    {
+      "step": 400,
+      "recon": 1.12682,
+      "val_recon": 1.00156
+    },
+    {
+      "step": 434,
+      "recon": 1.05109,
+      "val_recon": 1.05709
+    },
+    {
+      "step": 496,
+      "recon": 0.96224,
+      "val_recon": 1.03313
+    },
+    {
+      "step": 558,
+      "recon": 1.04814,
+      "val_recon": 1.03269
+    },
+    {
+      "step": 620,
+      "recon": 1.04126,
+      "val_recon": 1.04044
+    },
+    {
+      "step": 682,
+      "recon": 0.9394,
+      "val_recon": 0.97431
+    },
+    {
+      "step": 744,
+      "recon": 0.98328,
+      "val_recon": 0.97654
+    },
+    {
+      "step": 806,
+      "recon": 1.17227,
+      "val_recon": 1.02107
+    },
+    {
+      "step": 868,
+      "recon": 0.882,
+      "val_recon": 1.05474
+    },
+    {
+      "step": 930,
+      "recon": 1.05678,
+      "val_recon": 0.95558
+    },
+    {
+      "step": 992,
+      "recon": 1.05752,
+      "val_recon": 0.95908
+    },
+    {
+      "step": 1054,
+      "recon": 0.98337,
+      "val_recon": 0.96772
+    },
+    {
+      "step": 1116,
+      "recon": 0.95887,
+      "val_recon": 0.97269
+    },
+    {
+      "step": 1178,
+      "recon": 0.87337,
+      "val_recon": 0.95715
+    },
+    {
+      "step": 1240,
+      "recon": 0.87608,
+      "val_recon": 0.99245
+    },
+    {
+      "step": 1302,
+      "recon": 0.85114,
+      "val_recon": 0.96127
+    },
+    {
+      "step": 1364,
+      "recon": 0.93475,
+      "val_recon": 0.95946
+    },
+    {
+      "step": 1426,
+      "recon": 0.97592,
+      "val_recon": 0.93108
+    },
+    {
+      "step": 1488,
+      "recon": 0.89645,
+      "val_recon": 0.94053
+    },
+    {
+      "step": 1550,
+      "recon": 0.93587,
+      "val_recon": 0.92453
+    },
+    {
+      "step": 1612,
+      "recon": 0.88026,
+      "val_recon": 0.93012
+    },
+    {
+      "step": 1674,
+      "recon": 0.91466,
+      "val_recon": 0.92154
+    },
+    {
+      "step": 1736,
+      "recon": 1.00212,
+      "val_recon": 0.91851
+    },
+    {
+      "step": 1798,
+      "recon": 0.91377,
+      "val_recon": 0.91688
+    },
+    {
+      "step": 1860,
+      "recon": 0.97807,
+      "val_recon": 0.91603
+    },
+    {
+      "step": 1922,
+      "recon": 0.86558,
+      "val_recon": 0.91772
+    },
+    {
+      "step": 1984,
+      "recon": 0.79713,
+      "val_recon": 0.91427
+    },
+    {
+      "step": 2046,
+      "recon": 0.92433,
+      "val_recon": 0.90741
+    },
+    {
+      "step": 2108,
+      "recon": 0.75404,
+      "val_recon": 0.90609
+    },
+    {
+      "step": 2170,
+      "recon": 0.89058,
+      "val_recon": 0.9103
+    },
+    {
+      "step": 2232,
+      "recon": 0.89397,
+      "val_recon": 0.90458
+    },
+    {
+      "step": 2294,
+      "recon": 0.85361,
+      "val_recon": 0.90291
+    },
+    {
+      "step": 2356,
+      "recon": 0.77849,
+      "val_recon": 0.90285
+    },
+    {
+      "step": 2418,
+      "recon": 0.83879,
+      "val_recon": 0.90164
+    },
+    {
+      "step": 2480,
+      "recon": 0.92347,
+      "val_recon": 0.90195
+    },
+    {
+      "step": 2542,
+      "recon": 0.91644,
+      "val_recon": 0.90201
+    },
+    {
+      "step": 2604,
+      "recon": 0.86525,
+      "val_recon": 0.90035
+    },
+    {
+      "step": 2666,
+      "recon": 0.91834,
+      "val_recon": 0.90045
+    },
+    {
+      "step": 2728,
+      "recon": 1.00401,
+      "val_recon": 0.90002
+    },
+    {
+      "step": 2790,
+      "recon": 0.88857,
+      "val_recon": 0.89972
+    },
+    {
+      "step": 2852,
+      "recon": 0.94867,
+      "val_recon": 0.89954
+    },
+    {
+      "step": 2900,
+      "recon": 0.81036,
+      "val_recon": 0.89949
+    }
+  ],
+  "note": "DDSP harmonic+noise, timbre z=16, trained via train_ddsp.py"
+}

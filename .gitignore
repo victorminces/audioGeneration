@@ -26,11 +26,18 @@ data/processed/
 *.aif
 *.aiff
 
-# Model checkpoints (except the shipped default DDSP model, see README)
+# Model checkpoints (except the shipped DDSP models, see README)
 checkpoints/*
 *.pt
 *.pth
 *.ckpt
+# One per harmonic mode: the app needs both to offer the synth A/B.
+!checkpoints/ddsp_006.pt
+!checkpoints/ddsp_006.json
+!checkpoints/ddsp_007.pt
+!checkpoints/ddsp_007.json
+# Kept only as a warm-start source for --adapt; it predates the level
+# factoring and cannot be loaded by the current model.
 !checkpoints/ddsp_004.pt
 !checkpoints/ddsp_004.json
 

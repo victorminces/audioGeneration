@@ -29,9 +29,18 @@ from mapper import KernelMapper, load_latest_ddsp  # noqa: E402
 
 torch.set_num_threads(2)
 
-print("loading DDSP model…", flush=True)
-MODEL, MODEL_NAME = load_latest_ddsp(PROJ)
-print(f"model: {MODEL_NAME}", flush=True)
+print("loading DDSP models...", flush=True)
+# One per harmonic mode, so the front end can switch synthesis method live.
+# Both must exist; a missing one is a training step that hasn't been run, and
+# saying so beats silently offering half an A/B.
+MODELS, MODEL_NAMES = {}, {}
+for _m in ddsp.HARM_MODES:
+    MODELS[_m], MODEL_NAMES[_m] = load_latest_ddsp(PROJ, harm_mode=_m)
+    print(f"  {_m:>6}: {MODEL_NAMES[_m]}", flush=True)
+# Anything that isn't the timbre code is shared, so one model stands in for
+# both: f0 detection, loudness, the voiced mask.
+MODEL = MODELS[ddsp.HARM_MODES[0]]
+MODEL_NAME = " / ".join(f"{k}:{v}" for k, v in MODEL_NAMES.items())
 
 # One mapper per modality, kept side by side: a pad point and a body pose are
 # different kinds of thing, so their demonstrations can't be pooled — but they
@@ -88,24 +97,39 @@ LOCK = threading.Lock()
 def mapper_for(space):
     return MAPPERS.get(space if space in MAPPERS else "xy")
 
-# decoder weights, flattened once in a fixed order the worklet knows
-_sd = MODEL.decoder.state_dict()
+# decoder weights, flattened once per model in a fixed order the worklet knows
 DECODER_ORDER = [
     "mlp_in.0.weight", "mlp_in.0.bias", "mlp_in.1.weight", "mlp_in.1.bias",
     "mlp_in.3.weight", "mlp_in.3.bias", "mlp_in.4.weight", "mlp_in.4.bias",
     "gru.weight_ih_l0", "gru.weight_hh_l0", "gru.bias_ih_l0", "gru.bias_hh_l0",
     "mlp_out.0.weight", "mlp_out.0.bias", "mlp_out.1.weight", "mlp_out.1.bias",
-    "head_amp.weight", "head_amp.bias",
-    "head_harm.weight", "head_harm.bias",
     "head_noise.weight", "head_noise.bias",
+    "head_mix.weight", "head_mix.bias",
 ]
-_manifest, _chunks, _off = [], [], 0
-for name in DECODER_ORDER:
-    t = _sd[name].detach().cpu().numpy().astype(np.float32)
-    _manifest.append({"name": name, "shape": list(t.shape), "offset": _off})
-    _chunks.append(t.ravel())
-    _off += t.size
-WEIGHTS_BLOB = np.concatenate(_chunks).tobytes()
+# the harmonic head differs by mode and is the whole point of the comparison
+HARM_HEAD = {"amp": "head_harm", "filter": "head_env"}
+
+
+def _flatten(model):
+    sd = model.decoder.state_dict()
+    names = DECODER_ORDER + [f"{HARM_HEAD[model.harm_mode]}.weight",
+                             f"{HARM_HEAD[model.harm_mode]}.bias"]
+    manifest, chunks, off = [], [], 0
+    for name in names:
+        t = sd[name].detach().cpu().numpy().astype(np.float32)
+        manifest.append({"name": name, "shape": list(t.shape), "offset": off})
+        chunks.append(t.ravel())
+        off += t.size
+    return manifest, off, np.concatenate(chunks).tobytes()
+
+
+MANIFESTS, WEIGHTS_BLOBS = {}, {}
+for _m, _mod in MODELS.items():
+    _man, _off, _blob = _flatten(_mod)
+    MANIFESTS[_m] = {"name": MODEL_NAMES[_m], "harm_mode": _m,
+                     "tensors": _man, "total": _off,
+                     "f0_scale_min": _mod.f0_min, "f0_scale_max": _mod.f0_max}
+    WEIGHTS_BLOBS[_m] = _blob
 
 app = FastAPI()
 
@@ -113,8 +137,12 @@ app = FastAPI()
 def state_json(space="xy"):
     m = mapper_for(space)
     return {
-        # one row per thinned sample: [p_1..p_D, u_1..u_D, log_f0, loud, z_1..z_16]
-        # u = unit tangent of the stroke there; all-zero = no clear direction
+        # one row per thinned sample:
+        #   [p_1..p_D, u_1..u_D, log_f0, rel, z_amp(16), z_filter(16)]
+        # u = unit tangent of the stroke there; all-zero = no clear direction.
+        # rel is level relative to the take's performed level, not absolute
+        # log-RMS: the same phrase sung from twice the distance stores the
+        # same numbers. One z per harmonic mode, in ddsp.HARM_MODES order.
         "points": (np.concatenate([m.S, m.U, m.T], axis=1).tolist()
                    if m.ready else None),
         "space": space,
@@ -125,14 +153,17 @@ def state_json(space="xy"):
         "reach": m.reach,
         "seconds": m.seconds,
         "model": MODEL_NAME,
+        "modes": list(ddsp.HARM_MODES),
     }
 
 
 @app.get("/api/decoder/manifest")
 def decoder_manifest():
     return {
-        "tensors": _manifest,
-        "total": _off,
+        # one entry per harmonic mode; the front end fetches both blobs up
+        # front so the toggle costs nothing at switch time
+        "models": MANIFESTS,
+        "modes": list(ddsp.HARM_MODES),
         # Two ranges, and the worklet needs both. SCALE is how these particular
         # weights read their f0 input, so it comes from the checkpoint. PLAY is
         # how high the oscillator may go, which is the analyser's reach — the
@@ -141,15 +172,24 @@ def decoder_manifest():
         "constants": {"SR": ddsp.SR, "HOP": ddsp.HOP,
                       "N_HARMONICS": ddsp.N_HARMONICS,
                       "N_NOISE": ddsp.N_NOISE, "Z_DIM": ddsp.Z_DIM,
-                      "F0_SCALE_MIN": MODEL.f0_min, "F0_SCALE_MAX": MODEL.f0_max,
                       "F0_PLAY_MIN": ddsp.F0_DETECT_MIN,
-                      "F0_PLAY_MAX": ddsp.F0_DETECT_MAX},
+                      "F0_PLAY_MAX": ddsp.F0_DETECT_MAX,
+                      # the filter model's envelope grid: N_ENV log-spaced
+                      # bands from ENV_F_MIN to Nyquist, sampled at k*f0
+                      "N_ENV": ddsp.N_ENV, "ENV_F_MIN": ddsp.ENV_F_MIN,
+                      # level enters synthesis only as a multiply, and these
+                      # two are the whole of that path: amp = exp(rel +
+                      # REF_LOUD), and the noise branch is divided by
+                      # NOISE_UNIT_RMS so both branches arrive at unit level
+                      "REF_LOUD": ddsp.REF_LOUD,
+                      "NOISE_UNIT_RMS": ddsp.NOISE_UNIT_RMS},
     }
 
 
 @app.get("/api/decoder/weights")
-def decoder_weights():
-    return Response(WEIGHTS_BLOB, media_type="application/octet-stream")
+def decoder_weights(model: str = None):
+    which = model if model in WEIGHTS_BLOBS else ddsp.HARM_MODES[0]
+    return Response(WEIGHTS_BLOBS[which], media_type="application/octet-stream")
 
 
 @app.get("/api/state")
@@ -175,11 +215,53 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
 
     wt = torch.tensor(wav, dtype=torch.float32).unsqueeze(0)
     n_frames = max(1, wt.shape[1] // ddsp.HOP)
-    p = ddsp.analyze(MODEL, wt)
+
+    # Decide which frames were sung *before* analysing rather than after.
+    # Everything stored is relative to the take's performed level, so that
+    # level has to be measured over the singing and not over the silences
+    # between phrases — a take that is mostly silence would otherwise set a
+    # reference far below what was actually performed, and every stored frame
+    # would come back reading far too loud.
+    loud = ddsp.extract_loudness(wt, n_frames).numpy()
+    sung = (loud > float(loud_threshold) if loud_threshold is not None
+            else voiced_mask(loud))
+
+    # Crop to the sung span before the expensive part.
+    #
+    # Pitch tracking costs about 100 ms per second of audio and dominates
+    # everything else here, and it does not care whether a frame will be kept.
+    # The hands-together gesture guarantees long dead stretches — getting into
+    # position, walking back, deciding to stop — so a take can be minutes long
+    # around a few seconds of singing. Analysing all of it and then discarding
+    # 99% turned a two-second phrase into a 35-second wait.
+    #
+    # Cropping to the span rather than gathering the voiced frames: pitch
+    # tracking reads a window of context around each frame, so splicing
+    # phrases together would invent transients at every join. A margin keeps
+    # the real edges out of that window.
+    idx = np.flatnonzero(sung)
+    pad = int(round(0.25 * ddsp.SR / ddsp.HOP))
+    f_lo = max(0, int(idx[0]) - pad) if len(idx) else 0
+    f_hi = min(n_frames, int(idx[-1]) + 1 + pad) if len(idx) else n_frames
+    if f_hi - f_lo < n_frames:
+        wt = wt[:, f_lo * ddsp.HOP:f_hi * ddsp.HOP]
+        sung = sung[f_lo:f_hi]
+        n_frames = max(1, wt.shape[1] // ddsp.HOP)
+
+    # Analysed once per model. f0 and level are model-independent — they come
+    # from the signal, not the network — so only the timbre codes differ, and
+    # storing them side by side is what makes the A/B a comparison of methods
+    # rather than of two separate recordings.
+    p = ddsp.analyze(MODEL, wt, mask=sung)
     logf0 = p["f0"].clamp(min=1).log().numpy()
-    targets = np.concatenate([logf0[:, None], p["loud"].numpy()[:, None],
-                              p["z"].numpy()], axis=1)
-    t = (np.arange(n_frames) + 0.5) * ddsp.HOP / ddsp.SR
+    cols = [logf0[:, None], p["rel"].numpy()[:, None]]
+    mels = ddsp.mel_frames(wt, n_frames)        # same input for every encoder
+    for m in ddsp.HARM_MODES:
+        with torch.no_grad():
+            cols.append(MODELS[m].encoder(mels.unsqueeze(0))[0].numpy())
+    targets = np.concatenate(cols, axis=1)
+    # frame times are relative to the crop, the cursor is not
+    t = (np.arange(n_frames) + 0.5) * ddsp.HOP / ddsp.SR + f_lo * ddsp.HOP / ddsp.SR
     t = t[t <= cur[-1, 0]]                      # audio may outlast cursor
     # resample every gesture dimension onto the analysis frame times
     dim = cur.shape[1] - 1                      # column 0 is the timestamp
@@ -190,20 +272,18 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
     # Drop the frames you weren't actually singing on.
     #
     # A take is bracketed by getting into position and punctuated by breathing
-    # between phrases, and those frames are near-silent. The decoder renders
-    # them faithfully — as almost pure noise: measured on this model, frames in
-    # the quietest 40% come out ~170x breathier than sung ones, at a thousandth
-    # of the amplitude. Storing them means the instrument is quiet and breathy
-    # wherever you happened to be standing while not singing, which is most of
-    # the gesture space.
-    # Use the threshold the front end measured from the room during the hold
-    # gesture: it is what the live indicator was showing while you sang, so what
-    # gets dropped is exactly what you were told would be dropped. Without one
-    # (the x,y modality has no hold gesture) fall back to splitting the take's
-    # own loudness distribution.
-    loud_col = tg[:, 1]
-    keep = (loud_col > float(loud_threshold) if loud_threshold is not None
-            else voiced_mask(loud_col))
+    # between phrases, and those frames are near-silent — breath, not
+    # performance. Storing them means the instrument breathes at you wherever
+    # you happened to be standing while not singing, which is most of the
+    # gesture space.
+    #
+    # The threshold came from the front end, measured off the room during the
+    # hold gesture: it is what the live indicator was showing while you sang,
+    # so what gets dropped is exactly what you were told would be dropped.
+    # Without one (the x,y modality has no hold gesture) `sung` fell back to
+    # splitting the take's own loudness distribution. Either way it is the same
+    # mask the performed level was measured over, above.
+    keep = sung[:len(t)]
     dropped = int(len(keep) - keep.sum())
     if keep.sum() >= 6:                         # unless that leaves nothing to fit
         pts, tg = pts[keep], tg[keep]
