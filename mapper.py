@@ -45,13 +45,12 @@ def _bin_res(dim):
 
 
 class KernelMapper:
-    # [log_f0, rel] + one timbre code per harmonic mode. f0 and level are
-    # model-independent, but z is not — it comes from a particular encoder — so
-    # a take is analysed by every model and all the codes are stored in the
-    # same row. That is what lets the A/B toggle switch synthesis method
-    # instantly, on identical demonstrations and identical thinning, instead of
-    # comparing two models that saw different recordings.
-    N_OUT = 2 + len(ddsp.HARM_MODES) * ddsp.Z_DIM
+    # [log_f0, rel, ap, z_1..z_16]. The first three are measured from the
+    # signal; only z comes from the network. Measured quantities are the ones
+    # the kernel has to interpolate between demonstrations, and they interpolate
+    # as straight lines — which is what keeps a whistle blended with a fricative
+    # from stepping abruptly from all tone to all noise.
+    N_OUT = 3 + ddsp.Z_DIM
 
     def __init__(self, dim=2):
         self.mode = "aniso"
@@ -198,21 +197,13 @@ def _ckpt_rank(cfg, pt):
     return (1, int(m.group(1))) if m else (0, os.path.getmtime(pt))
 
 
-def load_latest_ddsp(proj=None, harm_mode=None):
-    """Newest compatible checkpoint, optionally restricted to one harm_mode.
-
-    `harm_mode` is how the app gets both halves of the A/B: "amp" for the model
-    that predicts each harmonic's amplitude, "filter" for the one that predicts
-    a spectral envelope and reads amplitudes off it. None takes whichever is
-    newest.
-    """
+def load_latest_ddsp(proj=None):
+    """Newest checkpoint whose architecture this module can load."""
     proj = proj or os.path.dirname(os.path.abspath(__file__))
     cfgs = []
     for p in glob.glob(os.path.join(proj, "checkpoints", "*.json")):
         with open(p) as f:
             cfg = json.load(f)
-        if harm_mode is not None and cfg.get("harm_mode", "amp") != harm_mode:
-            continue
         # The arch check is not cosmetic: ddsp_001..005 predate the level
         # factoring, so their decoders take an 18-wide input and carry a
         # head_amp. Loading one here would fail on a state-dict shape mismatch;
@@ -223,11 +214,10 @@ def load_latest_ddsp(proj=None, harm_mode=None):
                 cfgs.append((_ckpt_rank(cfg, pt), cfg, pt))
     if not cfgs:
         raise RuntimeError(
-            f"No checkpoint with arch '{ddsp.ARCH}'"
-            + (f" and harm_mode '{harm_mode}'" if harm_mode else "")
-            + " found in checkpoints/. Pre-factoring checkpoints "
-            "(ddsp_001..005) cannot be loaded by this version — train one with "
-            "train_ddsp.py, optionally warm-starting with --adapt ddsp_004.")
+            f"No checkpoint with arch '{ddsp.ARCH}' found in checkpoints/. "
+            "Older checkpoints carry an incompatible decoder input and cannot "
+            "be loaded — train one with train_ddsp.py, optionally warm-starting "
+            "from an older one with --adapt.")
     # Prefer a finished checkpoint over one still being written. train_ddsp.py
     # saves every few hundred steps so a run can be auditioned early, but the
     # newest file on disk during a long run is a half-trained model, and
@@ -241,8 +231,7 @@ def load_latest_ddsp(proj=None, harm_mode=None):
     # on 60-600; loading one with the current default would transpose
     # everything it plays by well over an octave.
     m = ddsp.DDSP(f0_min=float(cfg.get("f0_min", 60.0)),
-                  f0_max=float(cfg.get("f0_max", 600.0)),
-                  harm_mode=cfg.get("harm_mode", "amp"))
+                  f0_max=float(cfg.get("f0_max", 600.0)))
     m.load_state_dict(torch.load(pt, map_location="cpu", weights_only=True))
     m.eval()
     return m, cfg["name"]

@@ -32,12 +32,6 @@ const PAD_FEATURES = [
 // paths here, so switching back and forth never destroys the other's work.
 const SPACE_FEATURES = { xy: PAD_FEATURES, body: BODY_FEATURES };
 let space = "xy";               // "xy" | "body"
-// Which synthesis method is playing. Both decoders are resident in the
-// worklet and both timbre codes are stored in every map row, so this switches
-// instantly and on identical demonstrations — an A/B of methods, not of takes.
-//   "amp"     decoder predicts all 60 harmonic amplitudes directly
-//   "filter"  decoder predicts a spectral envelope, sampled at k*f0
-let harmMode = "amp";
 let features = PAD_FEATURES;    // whichever space is currently driving the map
 const GDIM = () => features.length;
 const demoPathsBy = { xy: [], body: [] };
@@ -129,26 +123,6 @@ spaceBtn.addEventListener("click", async () => {
   if (space === "body" && !camOn) setStatus("whole body needs the camera — turn it on");
 });
 
-// ── synthesis method A/B ────────────────────────────────────────────────────
-const HARM_LABEL = { amp: "synth: harmonics", filter: "synth: filter" };
-const harmBtn = document.getElementById("harm");
-
-function syncHarmBtn() {
-  harmBtn.textContent = HARM_LABEL[harmMode];
-  harmBtn.title = harmMode === "amp"
-    ? "the decoder predicts each harmonic's amplitude directly (pitch-relative)"
-    : "the decoder predicts a spectral envelope on absolute frequency and the "
-      + "harmonics are read off it at k*f0 (source-filter: formants stay put "
-      + "as the pitch moves)";
-}
-
-harmBtn.addEventListener("click", () => {
-  harmMode = harmMode === "amp" ? "filter" : "amp";
-  syncHarmBtn();
-  if (node) node.port.postMessage({ type: "model", mode: harmMode });
-});
-syncHarmBtn();
-
 let configBusy = false;
 async function postConfig(fields) {
   if (configBusy) return;
@@ -183,28 +157,21 @@ sigpEl.addEventListener("change", () => postConfig({ sigma_par: sigpEl.value }))
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   setStatus("loading decoder…");
-  const [manifest, st] = await Promise.all([
+  const [manifest, weights, st] = await Promise.all([
     fetch("/api/decoder/manifest").then(r => r.json()),
+    fetch("/api/decoder/weights").then(r => r.arrayBuffer()),
     fetch(`/api/state?space=${space}`).then(r => r.json()),
   ]);
-  // Both decoders are fetched up front and both live in the worklet, so
-  // switching synthesis method later is a pointer change and not a reload —
-  // you can A/B mid-phrase without the audio dropping out.
-  const weights = {};
-  await Promise.all(manifest.modes.map(async (m) => {
-    weights[m] = await fetch(`/api/decoder/weights?model=${m}`).then(r => r.arrayBuffer());
-  }));
   state = st;
   pos = new Array(GDIM()).fill(0.5);
 
   audioCtx = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
   // cache-bust: addModule ignores hard-refresh, so pin the worklet version
-  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=12");
+  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=13");
   node = new AudioWorkletNode(audioCtx, "instrument", {
     numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { manifest, weights, constants: manifest.constants },
   });
-  node.port.postMessage({ type: "model", mode: harmMode });
   node.port.onmessage = (e) => onWorklet(e.data);
   node.connect(audioCtx.destination);
 

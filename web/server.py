@@ -29,18 +29,9 @@ from mapper import KernelMapper, load_latest_ddsp  # noqa: E402
 
 torch.set_num_threads(2)
 
-print("loading DDSP models...", flush=True)
-# One per harmonic mode, so the front end can switch synthesis method live.
-# Both must exist; a missing one is a training step that hasn't been run, and
-# saying so beats silently offering half an A/B.
-MODELS, MODEL_NAMES = {}, {}
-for _m in ddsp.HARM_MODES:
-    MODELS[_m], MODEL_NAMES[_m] = load_latest_ddsp(PROJ, harm_mode=_m)
-    print(f"  {_m:>6}: {MODEL_NAMES[_m]}", flush=True)
-# Anything that isn't the timbre code is shared, so one model stands in for
-# both: f0 detection, loudness, the voiced mask.
-MODEL = MODELS[ddsp.HARM_MODES[0]]
-MODEL_NAME = " / ".join(f"{k}:{v}" for k, v in MODEL_NAMES.items())
+print("loading DDSP model...", flush=True)
+MODEL, MODEL_NAME = load_latest_ddsp(PROJ)
+print(f"model: {MODEL_NAME}", flush=True)
 
 # One mapper per modality, kept side by side: a pad point and a body pose are
 # different kinds of thing, so their demonstrations can't be pooled — but they
@@ -104,32 +95,16 @@ DECODER_ORDER = [
     "gru.weight_ih_l0", "gru.weight_hh_l0", "gru.bias_ih_l0", "gru.bias_hh_l0",
     "mlp_out.0.weight", "mlp_out.0.bias", "mlp_out.1.weight", "mlp_out.1.bias",
     "head_noise.weight", "head_noise.bias",
-    "head_mix.weight", "head_mix.bias",
+    "head_env.weight", "head_env.bias",
 ]
-# the harmonic head differs by mode and is the whole point of the comparison
-HARM_HEAD = {"amp": "head_harm", "filter": "head_env"}
-
-
-def _flatten(model):
-    sd = model.decoder.state_dict()
-    names = DECODER_ORDER + [f"{HARM_HEAD[model.harm_mode]}.weight",
-                             f"{HARM_HEAD[model.harm_mode]}.bias"]
-    manifest, chunks, off = [], [], 0
-    for name in names:
-        t = sd[name].detach().cpu().numpy().astype(np.float32)
-        manifest.append({"name": name, "shape": list(t.shape), "offset": off})
-        chunks.append(t.ravel())
-        off += t.size
-    return manifest, off, np.concatenate(chunks).tobytes()
-
-
-MANIFESTS, WEIGHTS_BLOBS = {}, {}
-for _m, _mod in MODELS.items():
-    _man, _off, _blob = _flatten(_mod)
-    MANIFESTS[_m] = {"name": MODEL_NAMES[_m], "harm_mode": _m,
-                     "tensors": _man, "total": _off,
-                     "f0_scale_min": _mod.f0_min, "f0_scale_max": _mod.f0_max}
-    WEIGHTS_BLOBS[_m] = _blob
+_sd = MODEL.decoder.state_dict()
+_manifest, _chunks, _off = [], [], 0
+for name in DECODER_ORDER:
+    t = _sd[name].detach().cpu().numpy().astype(np.float32)
+    _manifest.append({"name": name, "shape": list(t.shape), "offset": _off})
+    _chunks.append(t.ravel())
+    _off += t.size
+WEIGHTS_BLOB = np.concatenate(_chunks).tobytes()
 
 app = FastAPI()
 
@@ -138,11 +113,11 @@ def state_json(space="xy"):
     m = mapper_for(space)
     return {
         # one row per thinned sample:
-        #   [p_1..p_D, u_1..u_D, log_f0, rel, z_amp(16), z_filter(16)]
+        #   [p_1..p_D, u_1..u_D, log_f0, rel, ap, z_1..z_16]
         # u = unit tangent of the stroke there; all-zero = no clear direction.
         # rel is level relative to the take's performed level, not absolute
         # log-RMS: the same phrase sung from twice the distance stores the
-        # same numbers. One z per harmonic mode, in ddsp.HARM_MODES order.
+        # same numbers.
         "points": (np.concatenate([m.S, m.U, m.T], axis=1).tolist()
                    if m.ready else None),
         "space": space,
@@ -153,17 +128,15 @@ def state_json(space="xy"):
         "reach": m.reach,
         "seconds": m.seconds,
         "model": MODEL_NAME,
-        "modes": list(ddsp.HARM_MODES),
     }
 
 
 @app.get("/api/decoder/manifest")
 def decoder_manifest():
     return {
-        # one entry per harmonic mode; the front end fetches both blobs up
-        # front so the toggle costs nothing at switch time
-        "models": MANIFESTS,
-        "modes": list(ddsp.HARM_MODES),
+        "tensors": _manifest,
+        "total": _off,
+        "f0_scale_min": MODEL.f0_min, "f0_scale_max": MODEL.f0_max,
         # Two ranges, and the worklet needs both. SCALE is how these particular
         # weights read their f0 input, so it comes from the checkpoint. PLAY is
         # how high the oscillator may go, which is the analyser's reach — the
@@ -182,14 +155,14 @@ def decoder_manifest():
                       # REF_LOUD), and the noise branch is divided by
                       # NOISE_UNIT_RMS so both branches arrive at unit level
                       "REF_LOUD": ddsp.REF_LOUD,
+                      "AP_COL": 2,
                       "NOISE_UNIT_RMS": ddsp.NOISE_UNIT_RMS},
     }
 
 
 @app.get("/api/decoder/weights")
-def decoder_weights(model: str = None):
-    which = model if model in WEIGHTS_BLOBS else ddsp.HARM_MODES[0]
-    return Response(WEIGHTS_BLOBS[which], media_type="application/octet-stream")
+def decoder_weights():
+    return Response(WEIGHTS_BLOB, media_type="application/octet-stream")
 
 
 @app.get("/api/state")
@@ -248,18 +221,10 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
         sung = sung[f_lo:f_hi]
         n_frames = max(1, wt.shape[1] // ddsp.HOP)
 
-    # Analysed once per model. f0 and level are model-independent — they come
-    # from the signal, not the network — so only the timbre codes differ, and
-    # storing them side by side is what makes the A/B a comparison of methods
-    # rather than of two separate recordings.
     p = ddsp.analyze(MODEL, wt, mask=sung)
     logf0 = p["f0"].clamp(min=1).log().numpy()
-    cols = [logf0[:, None], p["rel"].numpy()[:, None]]
-    mels = ddsp.mel_frames(wt, n_frames)        # same input for every encoder
-    for m in ddsp.HARM_MODES:
-        with torch.no_grad():
-            cols.append(MODELS[m].encoder(mels.unsqueeze(0))[0].numpy())
-    targets = np.concatenate(cols, axis=1)
+    targets = np.concatenate([logf0[:, None], p["rel"].numpy()[:, None],
+                              p["ap"].numpy()[:, None], p["z"].numpy()], axis=1)
     # frame times are relative to the crop, the cursor is not
     t = (np.arange(n_frames) + 0.5) * ddsp.HOP / ddsp.SR + f_lo * ddsp.HOP / ddsp.SR
     t = t[t <= cur[-1, 0]]                      # audio may outlast cursor

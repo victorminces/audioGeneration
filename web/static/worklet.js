@@ -1,11 +1,12 @@
 /* Gesture instrument worklet: RBF map -> DDSP decoder -> harmonic+noise synth.
  *
  * Everything real-time happens here, at the audio rate, with no network:
- *  - kernel map: gesture point in [0,1]^D -> [log f0, relative level, z16]  (samples
- *    from the server; D is 2 for the mouse pad, 4 for the full-body features)
+ *  - kernel map: gesture point in [0,1]^D -> [log f0, rel level, aperiodicity,
+ *    z16] (from the server; D is 2 for the pad, 4 for full-body)
  *  - decoder: MLP -> GRU -> MLP -> heads (60 harmonic weights, 65 noise
- *    band gains, noise fraction), a port of ddsp.py's StreamingSynth. Level
- *    is not an input: it multiplies the mixed output and nothing else
+ *    band gains), a port of ddsp.py's StreamingSynth. Level and the
+ *    harmonic/noise balance are not network outputs: both are measured and
+ *    both simply multiply what it produces
  *  - synth: phase-accumulated oscillator bank + FFT-filtered noise (OLA)
  *
  * The node has one input (the mic, recorded on demand for demonstration
@@ -25,33 +26,20 @@ class Instrument extends AudioWorkletProcessor {
     const { manifest, weights, constants } = options.processorOptions;
     this.C = constants;                      // SR, HOP, N_HARMONICS, N_NOISE, Z_DIM
 
-    // One decoder per harmonic mode, both resident, so switching between them
-    // is a pointer change rather than a reload. `weights` is {mode: ArrayBuffer}.
-    //
-    // How each checkpoint's weights read f0 is baked in at training, so the
-    // scale is per model. It differs from how high the oscillator may actually
-    // run on purpose: the decoder extrapolates past its training range
-    // cleanly, so playback is limited by what the analyser can measure.
-    this.modes = manifest.modes;
-    this.M = {};
-    for (const mode of this.modes) {
-      const man = manifest.models[mode];
-      const all = new Float32Array(weights[mode]);
-      const T = {};
-      for (const t of man.tensors) {
-        const n = t.shape.reduce((a, b) => a * b, 1);
-        T[t.name] = { d: all.subarray(t.offset, t.offset + n), shape: t.shape };
-      }
-      this.M[mode] = {
-        T, harmMode: man.harm_mode, name: man.name,
-        f0Lo: Math.log2(man.f0_scale_min),
-        f0Span: Math.log2(man.f0_scale_max / man.f0_scale_min),
-        // where this model's timbre code sits in a map row:
-        // [log_f0, rel, z_mode0(16), z_mode1(16), ...]
-        zOff: 2 + this.modes.indexOf(mode) * this.C.Z_DIM,
-      };
+    const all = new Float32Array(weights);
+    this.T = {};                             // name -> {d: Float32Array, shape}
+    for (const t of manifest.tensors) {
+      const n = t.shape.reduce((a, b) => a * b, 1);
+      this.T[t.name] = { d: all.subarray(t.offset, t.offset + n), shape: t.shape };
     }
-    this._useModel(this.modes[0]);
+    // How the checkpoint reads f0 is baked in at training, so it comes from the
+    // manifest. It differs from how high the oscillator may run on purpose: the
+    // decoder extrapolates past its training range cleanly, so playback is
+    // limited by what the analyser can measure.
+    this.f0Lo = Math.log2(manifest.f0_scale_min);
+    this.f0Span = Math.log2(manifest.f0_scale_max / manifest.f0_scale_min);
+    // where the timbre code sits in a map row: [log_f0, rel, ap, z16]
+    this.zOff = 3;
 
     this.envFMin = this.C.ENV_F_MIN || 40;
     this.envSpan = Math.log2((MODEL_SR / 2) / this.envFMin);
@@ -82,7 +70,7 @@ class Instrument extends AudioWorkletProcessor {
     this.pts = null;                         // Float32Array, rows [p_1..p_D, u_1..u_D, 18 targets]
     this.nPts = 0;
     this.dim = 2;                            // D of the gesture space (2 = pad, 4 = body)
-    this.nOut = 2 + this.modes.length * this.C.Z_DIM;
+    this.nOut = 3 + this.C.Z_DIM;
     this.sigma = 0.15;                       // across-stroke width
     this.sigmaPar = 0.04;                    // along-stroke width (aniso mode)
     this.reach = 1.0;                        // gain radius, in multiples of sigma
@@ -99,13 +87,15 @@ class Instrument extends AudioWorkletProcessor {
     this.h = new Float32Array(256);          // GRU hidden
     this.noiseTail = new Float32Array(this.noiseFFT - this.hop);
     this._p = new Float32Array(this.nOut);
-    // decoder input is [f0, z...]: level is not part of it, by design
-    this._x = new Float32Array(1 + this.C.Z_DIM);
+    // decoder input is [f0, aperiodicity, z...]. Level is not part of it by
+    // design; aperiodicity is measured from the signal rather than predicted,
+    // for the same reason f0 is.
+    this._x = new Float32Array(2 + this.C.Z_DIM);
     this._h1 = new Float32Array(256);
     this._h2 = new Float32Array(256);
     this._g = new Float32Array(768);         // GRU input-side pre-activations
     this._gh = new Float32Array(768);        // GRU hidden-side pre-activations
-    this._cat = new Float32Array(256 + 1 + this.C.Z_DIM);
+    this._cat = new Float32Array(256 + 2 + this.C.Z_DIM);
     this._h3 = new Float32Array(256);
     this._harm = new Float32Array(this.C.N_HARMONICS);
     this._noise = new Float32Array(this.C.N_NOISE);
@@ -127,15 +117,6 @@ class Instrument extends AudioWorkletProcessor {
   _onMessage(m) {
     if (m.type === "breath") {
       this.breath = m.value;
-    } else if (m.type === "model") {
-      if (this.M[m.mode] && m.mode !== this.mode) {
-        this._useModel(m.mode);
-        // the GRU hidden state belongs to the decoder that produced it, so it
-        // is meaningless to the other one — start the new model clean
-        this.resetSynth();
-        this.port.postMessage({ type: "model", mode: m.mode,
-                                name: this.M[m.mode].name });
-      }
     } else if (m.type === "map") {
       this.sigma = m.sigma;
       this.sigmaPar = m.sigmaPar;
@@ -213,16 +194,6 @@ class Instrument extends AudioWorkletProcessor {
   }
 
   // ── decoder ───────────────────────────────────────────────────────────────
-  _useModel(mode) {
-    const m = this.M[mode];
-    this.mode = mode;
-    this.T = m.T;                            // _lin/_lnLeaky read through this
-    this.harmMode = m.harmMode;
-    this.f0Lo = m.f0Lo;
-    this.f0Span = m.f0Span;
-    this.zOff = m.zOff;
-  }
-
   // Hz -> fractional index into the log-spaced envelope bands. Mirrors
   // ddsp.env_band; the two must agree or the filter model reads its own
   // envelope at the wrong frequencies.
@@ -274,13 +245,14 @@ class Instrument extends AudioWorkletProcessor {
 
   _expSig(v) { const s = 1 / (1 + Math.exp(-v)); return 2 * Math.pow(s, 2.3) + 1e-7; }
 
-  // (f0, z) -> harm/noise shapes + noise fraction, all dimensionless. Level is
-  // deliberately absent: it multiplies the result in renderFrame and never
-  // reaches the network. Returns mix.
-  decodeFrame(f0, z) {
+  // (f0, aperiodicity, z) -> harm/noise shapes, both dimensionless. Level and
+  // balance are deliberately absent: both are measured, and both multiply the
+  // result in renderFrame without ever reaching the network.
+  decodeFrame(f0, ap, z) {
     const x18 = this._x;
     x18[0] = (Math.log2(Math.max(f0, 1)) - this.f0Lo) / this.f0Span;
-    for (let i = 0; i < this.C.Z_DIM; i++) x18[1 + i] = z[i];
+    x18[1] = ap;
+    for (let i = 0; i < this.C.Z_DIM; i++) x18[2 + i] = z[i];
 
     this._lin("mlp_in.0", x18, this._h1); this._lnLeaky("mlp_in.1", this._h1);
     this._lin("mlp_in.3", this._h1, this._h2); this._lnLeaky("mlp_in.4", this._h2);
@@ -308,38 +280,26 @@ class Instrument extends AudioWorkletProcessor {
     cat.set(h, 0); cat.set(x18, 256);
     this._lin("mlp_out.0", cat, this._h3); this._lnLeaky("mlp_out.1", this._h3);
 
-    const H = this.C.N_HARMONICS;
+    // a spectral envelope on absolute frequency, read at k*f0
+    const H = this.C.N_HARMONICS, NE = this.C.N_ENV, env = this._env;
+    const We = this.T["head_env.weight"].d, be = this.T["head_env.bias"].d;
+    for (let r = 0; r < NE; r++) {
+      let s = be[r];
+      const o = r * 256;
+      for (let c = 0; c < 256; c++) s += We[o + c] * this._h3[c];
+      env[r] = this._expSig(s);
+    }
+    // clamping pos rather than the frequency is equivalent: a frequency below
+    // envFMin lands at band 0 either way
     let hs = 0;
-    if (this.harmMode === "amp") {
-      // amplitude mode: one weight per harmonic, straight out of the head
-      const Whm = this.T["head_harm.weight"].d, bhm = this.T["head_harm.bias"].d;
-      for (let r = 0; r < H; r++) {
-        let s = bhm[r];
-        const o = r * 256;
-        for (let c = 0; c < 256; c++) s += Whm[o + c] * this._h3[c];
-        this._harm[r] = this._expSig(s); hs += this._harm[r];
-      }
-    } else {
-      // filter mode: a spectral envelope on absolute frequency, read at k*f0
-      const NE = this.C.N_ENV, env = this._env;
-      const We = this.T["head_env.weight"].d, be = this.T["head_env.bias"].d;
-      for (let r = 0; r < NE; r++) {
-        let s = be[r];
-        const o = r * 256;
-        for (let c = 0; c < 256; c++) s += We[o + c] * this._h3[c];
-        env[r] = this._expSig(s);
-      }
-      // clamping pos rather than the frequency is equivalent: a frequency
-      // below envFMin lands at band 0 either way
-      const scale = (NE - 1) / this.envSpan, lf = Math.log2(f0) - this.envLo;
-      for (let k = 1; k <= H; k++) {
-        let pos = (lf + this._log2k[k - 1]) * scale;
-        if (pos < 0) pos = 0; else if (pos > NE - 1) pos = NE - 1;
-        let i0 = pos | 0;
-        if (i0 > NE - 2) i0 = NE - 2;
-        const v = env[i0] + (env[i0 + 1] - env[i0]) * (pos - i0);
-        this._harm[k - 1] = v; hs += v;
-      }
+    const scale = (NE - 1) / this.envSpan, lf = Math.log2(f0) - this.envLo;
+    for (let k = 1; k <= H; k++) {
+      let pos = (lf + this._log2k[k - 1]) * scale;
+      if (pos < 0) pos = 0; else if (pos > NE - 1) pos = NE - 1;
+      let i0 = pos | 0;
+      if (i0 > NE - 2) i0 = NE - 2;
+      const v = env[i0] + (env[i0 + 1] - env[i0]) * (pos - i0);
+      this._harm[k - 1] = v; hs += v;
     }
     for (let r = 0; r < H; r++) this._harm[r] /= (hs + 1e-7);
 
@@ -355,10 +315,6 @@ class Instrument extends AudioWorkletProcessor {
     const nrms = Math.sqrt(ns / this.C.N_NOISE);
     for (let r = 0; r < this.C.N_NOISE; r++) this._noise[r] /= (nrms + 1e-7);
 
-    const Wx = this.T["head_mix.weight"].d, bx = this.T["head_mix.bias"].d;
-    let m = bx[0];
-    for (let c = 0; c < 256; c++) m += Wx[c] * this._h3[c];
-    return 1 / (1 + Math.exp(-m));            // noise fraction in [0, 1]
   }
 
   // ── synth: one HOP-sized block ────────────────────────────────────────────
@@ -381,10 +337,12 @@ class Instrument extends AudioWorkletProcessor {
     // `breath` trims the noise fraction: the balance the decoder learned comes
     // from speech, which carries more breath than a sustained instrument tone
     // wants. 1 = exactly as trained.
-    // each model has its own slice of the row; z from one is meaningless to
-    // the other, so the offset moves with the active model
     const z = p.subarray(this.zOff, this.zOff + this.C.Z_DIM);
-    const mix = Math.min(1, Math.max(0, this.decodeFrame(f0, z) * this.breath));
+    // column 2 is measured aperiodicity: the noise fraction, interpolated by
+    // the map like any other number rather than re-derived from an averaged z
+    const ap = Math.min(1, Math.max(0, p[2]));
+    this.decodeFrame(f0, ap, z);
+    const mix = Math.min(1, Math.max(0, ap * this.breath));
     const amp = Math.exp(p[1] + this.refLoud);
     const harm = this._harm, H = this.C.N_HARMONICS;
 

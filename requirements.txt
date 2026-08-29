@@ -1,8 +1,8 @@
 torch
 torchaudio
 soundfile
-torchcrepe
 fastapi
 uvicorn
 python-multipart
 requests
+librosa            # pYIN pitch tracking (ddsp.extract_f0)

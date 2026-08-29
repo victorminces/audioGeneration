@@ -31,15 +31,19 @@ checkpoints/*
 *.pt
 *.pth
 *.ckpt
-# One per harmonic mode: the app needs both to offer the synth A/B.
+# The model the app loads. A fresh clone plays without training.
+!checkpoints/ddsp_009.pt
+!checkpoints/ddsp_009.json
+# Warm-start ancestors for --adapt only. None of these can be loaded by the
+# current model: ddsp_004 predates the level factoring, and ddsp_006/007 are
+# the direct-amplitude and envelope pair from before the aperiodicity input.
+# They are 2.5 MB each and are what makes `--adapt` reproducible from scratch.
+!checkpoints/ddsp_004.pt
+!checkpoints/ddsp_004.json
 !checkpoints/ddsp_006.pt
 !checkpoints/ddsp_006.json
 !checkpoints/ddsp_007.pt
 !checkpoints/ddsp_007.json
-# Kept only as a warm-start source for --adapt; it predates the level
-# factoring and cannot be loaded by the current model.
-!checkpoints/ddsp_004.pt
-!checkpoints/ddsp_004.json
 
 # Outputs
 outputs/

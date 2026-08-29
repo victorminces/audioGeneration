@@ -1,0 +1,227 @@
+{
+  "name": "ddsp_009",
+  "filename": "ddsp_009.pt",
+  "domain": "ddsp",
+  "model_type": "ddsp",
+  "arch": "ddsp-factored-v3",
+  "latent_ch": 16,
+  "latent_units": 16,
+  "steps": 2900,
+  "steps_done": 2900,
+  "batch_size": 4,
+  "lr": 0.001,
+  "clip_seconds": 2.0,
+  "val_frac": 0.1,
+  "f0_min": 60.0,
+  "f0_max": 600.0,
+  "synth_frac": 0.3,
+  "clips_used": 2419,
+  "loss_history": [
+    {
+      "step": 72,
+      "recon": 0.92424,
+      "val_recon": 0.9591
+    },
+    {
+      "step": 144,
+      "recon": 0.86722,
+      "val_recon": 0.96202
+    },
+    {
+      "step": 216,
+      "recon": 0.91172,
+      "val_recon": 0.9661
+    },
+    {
+      "step": 288,
+      "recon": 1.13359,
+      "val_recon": 0.96989
+    },
+    {
+      "step": 360,
+      "recon": 0.88581,
+      "val_recon": 0.96286
+    },
+    {
+      "step": 432,
+      "recon": 0.81069,
+      "val_recon": 0.95631
+    },
+    {
+      "step": 504,
+      "recon": 1.00015,
+      "val_recon": 0.95787
+    },
+    {
+      "step": 576,
+      "recon": 0.95917,
+      "val_recon": 0.95691
+    },
+    {
+      "step": 648,
+      "recon": 0.99611,
+      "val_recon": 0.95543
+    },
+    {
+      "step": 720,
+      "recon": 0.94366,
+      "val_recon": 0.95269
+    },
+    {
+      "step": 792,
+      "recon": 0.89117,
+      "val_recon": 0.94996
+    },
+    {
+      "step": 864,
+      "recon": 1.01122,
+      "val_recon": 0.94952
+    },
+    {
+      "step": 936,
+      "recon": 0.97335,
+      "val_recon": 0.94997
+    },
+    {
+      "step": 1008,
+      "recon": 0.88652,
+      "val_recon": 0.94931
+    },
+    {
+      "step": 1080,
+      "recon": 0.90064,
+      "val_recon": 0.94632
+    },
+    {
+      "step": 1152,
+      "recon": 1.00055,
+      "val_recon": 0.94566
+    },
+    {
+      "step": 1224,
+      "recon": 1.00736,
+      "val_recon": 0.94772
+    },
+    {
+      "step": 1296,
+      "recon": 0.8355,
+      "val_recon": 0.94617
+    },
+    {
+      "step": 1368,
+      "recon": 0.91725,
+      "val_recon": 0.94518
+    },
+    {
+      "step": 1440,
+      "recon": 0.9052,
+      "val_recon": 0.94029
+    },
+    {
+      "step": 1512,
+      "recon": 0.94343,
+      "val_recon": 0.94374
+    },
+    {
+      "step": 1584,
+      "recon": 0.87352,
+      "val_recon": 0.94066
+    },
+    {
+      "step": 1656,
+      "recon": 1.07766,
+      "val_recon": 0.94608
+    },
+    {
+      "step": 1728,
+      "recon": 0.96297,
+      "val_recon": 0.9382
+    },
+    {
+      "step": 1800,
+      "recon": 0.88986,
+      "val_recon": 0.9383
+    },
+    {
+      "step": 1872,
+      "recon": 0.84478,
+      "val_recon": 0.94152
+    },
+    {
+      "step": 1944,
+      "recon": 0.99328,
+      "val_recon": 0.93861
+    },
+    {
+      "step": 2016,
+      "recon": 0.83191,
+      "val_recon": 0.9356
+    },
+    {
+      "step": 2088,
+      "recon": 0.94415,
+      "val_recon": 0.93988
+    },
+    {
+      "step": 2160,
+      "recon": 0.95703,
+      "val_recon": 0.93589
+    },
+    {
+      "step": 2232,
+      "recon": 0.94454,
+      "val_recon": 0.9354
+    },
+    {
+      "step": 2304,
+      "recon": 0.83348,
+      "val_recon": 0.93411
+    },
+    {
+      "step": 2376,
+      "recon": 1.063,
+      "val_recon": 0.9348
+    },
+    {
+      "step": 2448,
+      "recon": 0.89294,
+      "val_recon": 0.93419
+    },
+    {
+      "step": 2520,
+      "recon": 0.95256,
+      "val_recon": 0.93416
+    },
+    {
+      "step": 2592,
+      "recon": 0.88114,
+      "val_recon": 0.933
+    },
+    {
+      "step": 2664,
+      "recon": 0.8801,
+      "val_recon": 0.93254
+    },
+    {
+      "step": 2736,
+      "recon": 0.73907,
+      "val_recon": 0.93304
+    },
+    {
+      "step": 2808,
+      "recon": 0.81098,
+      "val_recon": 0.93266
+    },
+    {
+      "step": 2880,
+      "recon": 0.9989,
+      "val_recon": 0.93277
+    },
+    {
+      "step": 2900,
+      "recon": 0.95125,
+      "val_recon": 0.93272
+    }
+  ],
+  "note": "DDSP harmonic+noise, timbre z=16, trained via train_ddsp.py"
+}

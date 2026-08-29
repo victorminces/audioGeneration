@@ -19,7 +19,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio.transforms as T
-import torchcrepe
 
 SR          = 16000
 HOP         = 256            # 16 ms frames, matches the rest of the project
@@ -28,32 +27,53 @@ N_NOISE     = 65             # noise filter bands
 Z_DIM       = 16
 N_MELS      = 80
 
-# Two ways to get harmonic amplitudes, selected per checkpoint by `harm_mode`
-# and kept side by side so they can be compared on the same demonstrations.
+# Harmonic amplitudes come from a spectral envelope on absolute frequency,
+# sampled at k*f0 — the source-filter model. Formants stay where they are as
+# the pitch moves, instead of the network relearning them at every f0.
 #
-#   "amp"     the decoder predicts all 60 amplitudes directly. Indexed by
-#             harmonic number, so it is pitch-relative: harmonic 3 of a low
-#             note and harmonic 3 of a high one share a weight even though they
-#             sit an octave and a half apart in absolute frequency.
-#
-#   "filter"  the decoder predicts a spectral envelope on absolute frequency
-#             and the amplitudes are read off it at k*f0 — the source-filter
-#             model. Formants then stay where they are as the pitch moves,
-#             instead of the network having to relearn them at every f0.
+# The alternative, predicting all 60 amplitudes directly indexed by harmonic
+# number, was built and compared on identical demonstrations. Trained to the
+# same budget the two landed 0.6% apart on validation loss and were
+# indistinguishable by ear, differing only in harmonics 40 dB down. This one
+# was kept because it is the one that scales: its head size is independent of
+# how many harmonics are rendered, so a higher sample rate costs nothing here,
+# where the direct version would need 400 outputs to fill 24 kHz and waste 376
+# of them on a high note. Inharmonic partials, for bells and struck strings,
+# also read off the same curve — there is no slot for them in a head indexed by
+# harmonic number.
 #
 # Envelope bands are log-spaced. 65 bands from 40 Hz to Nyquist is ~8.6 per
 # octave everywhere; a linear grid over the same range would put 123 Hz between
 # neighbours and barely resolve the first two harmonics of a low voice.
-HARM_MODES  = ("amp", "filter")
 N_ENV       = 65
 ENV_F_MIN   = 40.0           # a little below the lowest f0 the analyser reports
 
 # Two different ranges, easily confused.
 #
-# DETECT is what the analyser can measure. Its ceiling is torchcrepe's, not a
-# preference: CREPE is a classifier over 360 bins of 20 cents from C1, six
-# octaves ending at 2092 Hz, with MAX_FMAX = 2006. Above that it can only
-# answer with a subharmonic.
+# DETECT is what the analyser can measure. pYIN is autocorrelation-based, so
+# this is a search range and not an architectural limit. CREPE, which this used
+# to use, is a classifier over fixed bins ending at 2093 Hz, and that ceiling
+# was a real problem: a whistle at 2041 Hz sits on its last few bins and reads
+# 1939, audible as a warbling electronic tone.
+#
+# That ceiling is a known, unfixed limitation, not an oversight. A real whistle
+# at 2041 Hz sits on the last few bins and reads 1939, with only 30 dB of
+# spectral support and a whole octave wrong on 29% of frames — audible as a
+# warbling, electronic-sounding tone. Four alternatives were measured against
+# the spectrum itself, and every one trades the ceiling for something worse:
+#
+#   pYIN            right on the clean whistle (2058 Hz, 70 dB support) but its
+#                   voicing gate refuses noisy frames and rails to the search
+#                   bounds - 3998 Hz for a 220 Hz tone under half noise.
+#   YIN (no gate)   collapses to ~150 Hz on the same noisy material.
+#   half-speed      shifts CREPE's window up an octave and fixes the whistle
+#                   (2050 Hz), but its 1024-sample window then spans 64 ms of
+#                   real audio instead of 128, and it loses the pitch under
+#                   noise: 112 Hz for a 220 Hz tone at half noise.
+#   lower ceiling   forces the whistle to a subharmonic, which is worse.
+#
+# CREPE at normal speed is the only one robust across noise levels, so it
+# stays. Whistling above ~1900 Hz is the price, and it is a real one.
 #
 # SCALE is how a trained decoder reads its f0 input, and is baked into the
 # weights — a checkpoint carries the one it was trained with. It stays at
@@ -64,15 +84,28 @@ ENV_F_MIN   = 40.0           # a little below the lowest f0 the analyser reports
 # match DETECT would only spend resolution to avoid an extrapolation that
 # already works.
 F0_DETECT_MIN = 60.0
-F0_DETECT_MAX = 2000.0
+F0_DETECT_MAX = 4000.0        # a search bound now, not a model limit
 F0_SCALE_MIN = 60.0
 F0_SCALE_MAX = 600.0
 
+# Half-width of the harmonic windows used to measure aperiodicity, as a
+# fraction of f0. Constant on purpose; see extract_aperiodicity.
+AP_WIDTH = 0.15
+
 # Written into every checkpoint's config and checked when one is loaded.
-# ddsp_001..005 predate the level factoring and carry "ddsp": their decoders
-# take an 18-wide input and have a head_amp, so they cannot be loaded into this
-# module at all. Refusing them by name beats a state-dict shape error.
-ARCH = "ddsp-factored-v1"
+# Decoder input layouts, all incompatible with each other:
+#   "ddsp"              [f0, loudness, z16]      ddsp_001..005
+#   "ddsp-factored-v1"  [f0, z16]                ddsp_006..007
+#   "ddsp-factored-v2"  [f0, aperiodicity, z16]  ddsp_008: CREPE pitch
+#   "ddsp-factored-v3"  [f0, aperiodicity, z16]  current: pYIN pitch
+# v1 is 17 wide; the rest are 18. v0 and v2 differ in what column 1 means, and
+# v2 and v3 are identical in shape while differing in how the pitch was
+# measured — the two trackers disagree by an octave on a whistle, so a model
+# trained against one reads the other wrongly. No shape check catches either
+# case, which is why the name is what gates loading.
+ARCH_V1 = "ddsp-factored-v1"
+ARCH_V2 = "ddsp-factored-v2"
+ARCH = "ddsp-factored-v3"
 
 # What "level" means on the way out. Analysis subtracts each take's performed
 # level and stores relative dynamics; this puts them back on a fixed absolute
@@ -107,19 +140,93 @@ NOISE_UNIT_RMS = 0.576
 # floor depends on the whole take.
 _DYN_FLOOR = 1e-4
 
+# Everything below the lowest pitch we can detect is rejected before analysis.
+#
+# Not converter rumble and not the room: measured on real takes, the sub-60 Hz
+# level sits at a constant floor during silence and rises 6-15 dB *while you
+# perform* — breath hitting the capsule, and the microphone moving. It is
+# inaudible (nothing reproduces 20 Hz, and ears roll off below that) so it
+# survives every listening test, while arithmetic sees it plainly: it was 51%
+# of the energy in a take recorded two steps further away, which made a voiced
+# vowel measure 89% noise.
+#
+# Being linear, this cannot disturb gain invariance: filtering g*x gives
+# g*filter(x) exactly.
+HP_CUTOFF = F0_DETECT_MIN               # by construction: below this is not signal
+_HP_TAPS = 1025                         # 64 ms, ~40 dB down an octave below cutoff
+_hp_kernel = None
+
+
+def highpass(wav, fc=HP_CUTOFF, n=_HP_TAPS, chunk=128):
+    """(..., samples) -> same shape, linear phase so nothing is time-shifted.
+
+    Shape-general so the training cache can be filtered in one call, and
+    chunked because filtering 2419 clips at once wants more memory than this
+    machine has spare.
+    """
+    global _hp_kernel
+    if _hp_kernel is None or _hp_kernel.shape[-1] != n:
+        k = np.arange(n) - (n - 1) // 2
+        lp = np.sinc(2 * fc / SR * k) * (2 * fc / SR) * np.hamming(n)
+        lp = lp / lp.sum()
+        hp = -lp
+        hp[(n - 1) // 2] += 1.0         # spectral inversion of the low-pass
+        _hp_kernel = torch.tensor(hp, dtype=torch.float32).view(1, 1, -1)
+    pad = n // 2
+    if wav.shape[-1] <= pad:            # too short to reflect: leave it alone
+        return wav
+    x = wav.reshape(-1, 1, wav.shape[-1])
+    ker = _hp_kernel.to(wav.dtype)
+    out = torch.empty_like(x)
+    for i in range(0, x.shape[0], chunk):
+        blk = F.pad(x[i:i + chunk], (pad, pad), mode="reflect")
+        out[i:i + chunk] = F.conv1d(blk, ker)
+    return out.reshape(wav.shape)
+
+
 _mel = T.MelSpectrogram(sample_rate=SR, n_fft=1024, hop_length=HOP, n_mels=N_MELS)
 
 
 # ── analysis ──────────────────────────────────────────────────────────────────
 
 def extract_f0(wav, n_frames, f0_min=F0_DETECT_MIN, f0_max=F0_DETECT_MAX):
-    """(1, samples) -> (n_frames,) f0 in Hz (unvoiced frames get held/low values;
-    the decoder learns to silence harmonics there via the mix head)."""
-    # weighted_argmax decoder is pure torch (the default viterbi decoder pulls
-    # in librosa -> numba, which breaks against numpy >= 2.2)
-    f0 = torchcrepe.predict(wav, SR, hop_length=HOP, fmin=f0_min, fmax=f0_max,
-                            model="tiny", batch_size=512, device="cpu",
-                            decoder=torchcrepe.decode.weighted_argmax)[0]
+    """(1, samples) -> (n_frames,) f0 in Hz, a value on every frame.
+
+    pYIN (Mauch & Dixon 2014): YIN's difference function with an HMM over pitch
+    candidates. Chosen over CREPE by measuring both against the spectrum rather
+    than against each other — for a claimed pitch, how far it stands above the
+    frame's median spectral level, and whether more energy sits an octave above:
+
+                          support   unsupported   octave errors
+          CREPE   1939 Hz    30 dB        12%          29%
+          pYIN    2058 Hz    70 dB         0%           0%
+
+    on a real whistle whose true pitch is 2041 Hz by direct spectral
+    measurement. On the other real takes the two agree: 928 against 932 for a
+    low whistle, 132 against 133 for a vowel.
+
+    pYIN also declines to answer on frames it judges unvoiced. On constructed
+    tone-plus-noise mixtures at half noise that makes it rail to the search
+    bounds, where CREPE holds the pitch — the one place CREPE is better. It is
+    accepted because voicing is now measured separately: a frame with no pitch
+    gets aperiodicity near 1, the harmonic branch is silenced there, and what
+    the tracker said stops mattering. The failure that was audible was CREPE's.
+
+    Unvoiced gaps are bridged by interpolation rather than zeroed. The
+    synthesiser needs a pitch every frame, and the value is averaged into the
+    map, so a smooth line through a gap beats a jump to nothing and back.
+    """
+    import librosa                                   # heavy; imported on use
+    x = wav[0].detach().cpu().numpy().astype(np.float64)
+    f0, _, _ = librosa.pyin(x, fmin=f0_min, fmax=f0_max, sr=SR,
+                            frame_length=2048, hop_length=HOP, fill_na=np.nan)
+    ok = np.isfinite(f0)
+    if ok.any():
+        idx = np.arange(len(f0))
+        f0 = np.interp(idx, idx[ok], f0[ok])
+    else:
+        f0 = np.full(len(f0), f0_min)
+    f0 = torch.tensor(f0, dtype=torch.float32)
     return F.interpolate(f0.view(1, 1, -1), size=n_frames,
                          mode="linear", align_corners=True)[0, 0]
 
@@ -141,6 +248,84 @@ def mel_frames(wav, n_frames):
     m = p.clamp(min=floor).log()[0].T                     # (T', N_MELS)
     return F.interpolate(m.T.unsqueeze(0), size=n_frames,
                          mode="linear", align_corners=True)[0].T
+
+
+def extract_aperiodicity(wav, f0, n_frames, n_fft=2048, width=AP_WIDTH):
+    """(1, samples) + f0 -> (n_frames,) noise fraction per frame, in [0, 1].
+
+    Measured, not learned, for the same reason f0 is. The decoder used to
+    predict this balance and was demonstrably bad at it: on a whispered vowel
+    its head answered 0.078 where the truth is 1.0, rebuilding a whisper as a
+    pitched voice, because it had learned to read voicing from which
+    frequencies carry energy — true across read speech and false the moment you
+    whisper. Handing it in also makes the balance interpolate as a straight line
+    between demonstrations rather than stepping off a cliff.
+
+    The question asked is "is the energy sitting on a harmonic grid?": with f0
+    known, harmonics belong at k*f0, and whatever falls between those positions
+    is noise.
+
+    Boersma's harmonics-to-noise ratio was tried instead, as the thirty-year
+    standard, and rejected on measurement. It asks a different question — "does
+    the waveform repeat at this period?" — which is undefined when there is no
+    period, and Praat accordingly reports it for voiced frames only. We need a
+    number on every frame. On a real whisper, where the tracker returns an
+    arbitrary 832 Hz and so a very short lag, short-lag autocorrelation of noise
+    is not small and HNR read 0.530 where the truth is ~1; it could not exceed
+    0.891 even on pure noise. This measure reads the same whisper at 0.888.
+    HNR was the more accurate of the two on clean mixtures (0.014 mean absolute
+    error against 0.003) — it simply fails where it matters most here.
+
+    Two things make this work, both found by calibrating against mixtures whose
+    noise fraction is known by construction:
+
+    The result is debiased for coverage. If the windows occupy a fraction c of
+    the spectrum, pure noise still lands c of its energy inside them, so raw
+    off-window energy underreads by exactly that much. With h the fraction of
+    energy inside the windows, a mixture with noise fraction a has
+    h = (1-a) + a*c, hence a = (1-h)/(1-c).
+
+    And the windows are a constant fraction of f0 wide, so coverage is the same
+    at every frequency and one global c is valid. An earlier version scaled the
+    width with harmonic number, which made windows narrow low down and wide up
+    high; coverage then varied across the spectrum while the debias used a
+    single number, and anything with its energy concentrated low — every vowel —
+    read far too noisy. Mean absolute error over formant-shaped mixtures went
+    from 0.160 to 0.001 on making the width uniform.
+
+    It inherits the pitch tracker's errors: a comb in the wrong place makes real
+    harmonics look like noise. And it cannot separate noise from *inharmonic*
+    partials — a bell-like tone with no noise reads about 0.15 — because
+    partials off the harmonic grid are, to this measure, indistinguishable from
+    noise. That needs free partials in the synthesiser, not a better measurement.
+    """
+    win = torch.hann_window(n_fft)
+    S = torch.stft(wav, n_fft=n_fft, hop_length=HOP, window=win,
+                   return_complex=True)
+    P = (S.abs() ** 2)[0]                                  # (bins, T')
+    bins, n_t = P.shape
+    bin_hz = SR / n_fft
+    f0t = F.interpolate(f0.view(1, 1, -1), size=n_t, mode="linear",
+                        align_corners=True)[0, 0].clamp(min=1.0)
+
+    # loop over harmonic number rather than over frames: 60 iterations instead
+    # of thousands, which keeps this affordable on a whole training cache
+    idx = torch.arange(bins).view(1, -1)                   # (1, bins)
+    mask = torch.zeros(n_t, bins, dtype=torch.bool)
+    hw = torch.clamp(width * f0t, min=1.5 * bin_hz).view(-1, 1)
+    for k in range(1, N_HARMONICS + 1):
+        c = (k * f0t).view(-1, 1)                          # (T', 1)
+        mask |= ((idx * bin_hz - c).abs() <= hw) & (c < SR / 2)
+
+    Pt = P.T                                               # (T', bins)
+    tot = Pt.sum(dim=1)
+    inside = (Pt * mask).sum(dim=1)
+    cov = mask.to(Pt.dtype).mean(dim=1)
+    h = inside / tot.clamp(min=1e-12)
+    ap = ((1.0 - h) / (1.0 - cov).clamp(min=1e-6)).clamp(0.0, 1.0)
+    ap = torch.where(tot > 1e-12, ap, torch.ones_like(ap))  # silence has no tone
+    return F.interpolate(ap.view(1, 1, -1), size=n_frames, mode="linear",
+                         align_corners=True)[0, 0]
 
 
 def _top_frames_mean(v, q=0.6):
@@ -273,65 +458,53 @@ class TimbreEncoder(nn.Module):
 class Decoder(nn.Module):
     """(f0, z) frames -> harmonic shape, noise shape, and the balance between.
 
-    Level is neither an input nor an output. Everything here is dimensionless:
-    `harm` sums to 1, `noise` has unit RMS across bands, and `mix` is the noise
-    fraction in [0, 1]. The performed level multiplies the result in
-    synthesize() and touches nothing the network computes.
+    Level is neither an input nor an output, and neither is the harmonic/noise
+    balance. Everything here is dimensionless shape: `harm` sums to 1 and
+    `noise` has unit RMS across bands. Level and balance both multiply the
+    result in synthesize() and touch nothing the network computes.
 
-    Making the balance an explicit bounded output also removes a failure mode
-    of the previous design, where harmonic level came from an `amp` head and
-    noise level from the unbounded magnitude of the noise head, with nothing
-    tying the two together: on quiet input the ratio ran to ~600x noise. A
-    sigmoid cannot do that.
+    The balance used to be a `mix` head predicted from z. It is now measured
+    from the signal instead (see extract_aperiodicity) and passed in as an
+    input, for the same reason f0 is measured rather than learned: the network
+    was demonstrably bad at it. On a whispered vowel the head answered 0.078
+    where the truth is 1.0, rebuilding a whisper as a pitched voice — it had
+    learned to read voicing from which frequencies carry energy, which holds
+    across LibriSpeech and breaks the moment you whisper.
+
+    Handing it in also makes the balance interpolate honestly. As a head output
+    it was a sharp function of averaged z: blending a whistle with a fricative
+    held at 0% noise through 25% and then jumped to 96%. A measured quantity
+    stored in the map is a straight line between the two.
     """
-    def __init__(self, harm_mode="amp"):
+    def __init__(self):
         super().__init__()
-        if harm_mode not in HARM_MODES:
-            raise ValueError(f"harm_mode must be one of {HARM_MODES}, got {harm_mode!r}")
-        self.harm_mode = harm_mode
-        in_dim = 1 + Z_DIM
+        in_dim = 2 + Z_DIM                      # f0, aperiodicity, z
         self.mlp_in = nn.Sequential(nn.Linear(in_dim, 256), nn.LayerNorm(256), nn.LeakyReLU(),
                                     nn.Linear(256, 256), nn.LayerNorm(256), nn.LeakyReLU())
         self.gru = nn.GRU(256, 256, batch_first=True)
         self.mlp_out = nn.Sequential(nn.Linear(256 + in_dim, 256), nn.LayerNorm(256), nn.LeakyReLU())
-        if harm_mode == "amp":
-            self.head_harm = nn.Linear(256, N_HARMONICS)
-        else:
-            self.head_env = nn.Linear(256, N_ENV)
+        self.head_env = nn.Linear(256, N_ENV)
         self.head_noise = nn.Linear(256, N_NOISE)
-        self.head_mix   = nn.Linear(256, 1)
 
-    def forward(self, f0_s, z, f0_hz=None):               # (B, T), (B, T, Z_DIM)
-        x = torch.cat([f0_s.unsqueeze(-1), z], dim=-1)
+    def forward(self, f0_s, ap, z, f0_hz):               # (B, T), (B, T), (B, T, Z)
+        x = torch.cat([f0_s.unsqueeze(-1), ap.unsqueeze(-1), z], dim=-1)
         h = self.mlp_in(x)
         h, _ = self.gru(h)
         h = self.mlp_out(torch.cat([h, x], dim=-1))
-        if self.harm_mode == "amp":
-            harm = _exp_sigmoid(self.head_harm(h))        # (B, T, H)
-            harm = harm / (harm.sum(dim=-1, keepdim=True) + 1e-7)
-        else:
-            if f0_hz is None:
-                raise ValueError("filter mode needs f0 in Hz to sample the "
-                                 "envelope at k*f0")
-            harm = env_to_harm(_exp_sigmoid(self.head_env(h)), f0_hz)
+        harm = env_to_harm(_exp_sigmoid(self.head_env(h)), f0_hz)
         noise = _exp_sigmoid(self.head_noise(h))          # (B, T, N_NOISE)
         noise = noise / (noise.pow(2).mean(dim=-1, keepdim=True).sqrt() + 1e-7)
-        mix   = torch.sigmoid(self.head_mix(h))           # (B, T, 1)
-        return harm, noise, mix
+        return harm, noise
 
 
 class DDSP(nn.Module):
-    def __init__(self, f0_min=F0_SCALE_MIN, f0_max=F0_SCALE_MAX, harm_mode="amp"):
+    def __init__(self, f0_min=F0_SCALE_MIN, f0_max=F0_SCALE_MAX):
         super().__init__()
         self.encoder = TimbreEncoder()
-        self.decoder = Decoder(harm_mode)
+        self.decoder = Decoder()
         # not parameters — the range the weights were trained to interpret,
         # restored from the checkpoint's config rather than the state dict
         self.f0_min, self.f0_max = f0_min, f0_max
-
-    @property
-    def harm_mode(self):
-        return self.decoder.harm_mode
 
     # -- synthesis ------------------------------------------------------------
     @staticmethod
@@ -390,11 +563,12 @@ class DDSP(nn.Module):
         return amp_up * ((1 - mix_up).sqrt() * audio_h + mix_up.sqrt() * audio_n)
 
     # -- end to end -----------------------------------------------------------
-    def forward(self, mels, f0, amp):
-        """mels (B,T,80) log-mel; f0 (B,T) Hz; amp (B,T) target RMS -> (B, samples)."""
+    def forward(self, mels, f0, amp, ap):
+        """mels (B,T,80); f0 (B,T) Hz; amp (B,T) target RMS; ap (B,T) noise
+        fraction -> (B, samples)."""
         z = self.encoder(mels)
-        harm, noise, mix = self.decoder(scale_f0(f0, self.f0_min, self.f0_max), z, f0)
-        return self.synthesize(f0, amp.unsqueeze(-1), harm, noise, mix)
+        harm, noise = self.decoder(scale_f0(f0, self.f0_min, self.f0_max), ap, z, f0)
+        return self.synthesize(f0, amp.unsqueeze(-1), harm, noise, ap.unsqueeze(-1))
 
 
 # ── loss ──────────────────────────────────────────────────────────────────────
@@ -423,16 +597,19 @@ def analyze(model, wav, mask=None):
     performance recorded at two microphone distances analyses identically.
     `ref` is the level that was subtracted, reported for inspection only —
     nothing downstream reads it. `mask` marks the frames that count as
-    performance.
+    performance. The waveform is high-passed first, so every feature here is
+    derived from the same filtered signal.
     """
     n_frames = wav.shape[1] // HOP
+    wav  = highpass(wav)                      # before anything reads the signal
     f0   = extract_f0(wav, n_frames)          # measure as high as we can see
     loud = extract_loudness(wav, n_frames)
+    ap   = extract_aperiodicity(wav, f0, n_frames)
     mels = mel_frames(wav, n_frames)
     ref  = performed_level(loud, mask)
     with torch.no_grad():
         z = model.encoder(mels.unsqueeze(0))[0]           # (T, Z_DIM)
-    return {"f0": f0, "rel": loud - ref, "z": z, "ref": ref}
+    return {"f0": f0, "rel": loud - ref, "ap": ap, "z": z, "ref": ref}
 
 
 def blend_params(params_list, weights):
@@ -441,18 +618,21 @@ def blend_params(params_list, weights):
     T_min = min(p["f0"].shape[0] for p in params_list)
     logf0 = sum(w * p["f0"][:T_min].clamp(min=1).log() for w, p in zip(weights, params_list))
     rel   = sum(w * p["rel"][:T_min] for w, p in zip(weights, params_list))
+    ap    = sum(w * p["ap"][:T_min] for w, p in zip(weights, params_list))
     z     = sum(w * p["z"][:T_min] for w, p in zip(weights, params_list))
-    return {"f0": logf0.exp(), "rel": rel, "z": z}
+    return {"f0": logf0.exp(), "rel": rel, "ap": ap, "z": z}
 
 
 def synthesize_params(model, params):
     """Parameter dict -> (1, samples) waveform."""
     with torch.no_grad():
-        harm, noise, mix = model.decoder(
+        ap = params["ap"].unsqueeze(0)
+        harm, noise = model.decoder(
             scale_f0(params["f0"], model.f0_min, model.f0_max).unsqueeze(0),
-            params["z"].unsqueeze(0), params["f0"].unsqueeze(0))
+            ap, params["z"].unsqueeze(0), params["f0"].unsqueeze(0))
         amp = level_to_amp(params["rel"]).unsqueeze(0).unsqueeze(-1)
-        wav = model.synthesize(params["f0"].unsqueeze(0), amp, harm, noise, mix)
+        wav = model.synthesize(params["f0"].unsqueeze(0), amp, harm, noise,
+                               ap.unsqueeze(-1))
     return wav
 
 
@@ -475,34 +655,31 @@ class StreamingSynth:
         self.prev = None                       # previous frame (f0, amp, harm, mix)
         self.noise_tail = np.zeros(self.NOISE_FFT - HOP, dtype=np.float64)
 
-    def _decode_frame(self, f0, z):
-        """One decoder step with carried GRU state -> (harm, noise, mix)."""
+    def _decode_frame(self, f0, ap, z):
+        """One decoder step with carried GRU state -> (harm, noise)."""
         d = self.model.decoder
-        x = torch.empty(1, 1, 1 + Z_DIM, dtype=torch.float32)
+        x = torch.empty(1, 1, 2 + Z_DIM, dtype=torch.float32)
         lo = np.log2(self.model.f0_min)                       # scale_f0, scalar
         span = np.log2(self.model.f0_max / self.model.f0_min)
         x[0, 0, 0] = (np.log2(max(f0, 1.0)) - lo) / span
-        x[0, 0, 1:] = torch.from_numpy(np.asarray(z, dtype=np.float32))
+        x[0, 0, 1] = float(ap)
+        x[0, 0, 2:] = torch.from_numpy(np.asarray(z, dtype=np.float32))
         with torch.inference_mode():
             hh = d.mlp_in(x)
             hh, h_new = d.gru(hh, self.h)
             self.h = h_new.clone()
             hh = d.mlp_out(torch.cat([hh, x], dim=-1))
-            if d.harm_mode == "amp":
-                harm = _exp_sigmoid(d.head_harm(hh))[0, 0]
-                harm = harm / (harm.sum() + 1e-7)
-            else:
-                harm = env_to_harm(_exp_sigmoid(d.head_env(hh)),
-                                   torch.tensor([[float(f0)]]))[0, 0]
+            harm = env_to_harm(_exp_sigmoid(d.head_env(hh)),
+                               torch.tensor([[float(f0)]]))[0, 0]
             noise = _exp_sigmoid(d.head_noise(hh))[0, 0]
             noise = noise / (noise.pow(2).mean().sqrt() + 1e-7)
-            mix   = torch.sigmoid(d.head_mix(hh))[0, 0, 0]
         return (harm.numpy().astype(np.float64),
-                noise.numpy().astype(np.float64), float(mix))
+                noise.numpy().astype(np.float64))
 
-    def render(self, f0, rel, z):
+    def render(self, f0, rel, ap, z):
         """One frame of parameters -> HOP samples (numpy float32)."""
-        harm, noise, mix = self._decode_frame(f0, z)
+        harm, noise = self._decode_frame(f0, ap, z)
+        mix = float(np.clip(ap, 0.0, 1.0))
         amp = float(np.exp(rel + REF_LOUD))
         if self.prev is None:
             self.prev = (f0, amp, harm, mix)
