@@ -223,8 +223,19 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
     # reference far below what was actually performed, and every stored frame
     # would come back reading far too loud.
     loud = ddsp.extract_loudness(wt, n_frames).numpy()
-    sung = (loud > float(loud_threshold) if loud_threshold is not None
-            else voiced_mask(loud))
+    # The x,y modality needs no gate: the mouse button *is* the record button,
+    # so every frame between press and release was deliberately performed.
+    # Gating it can only throw away material the performer meant to keep - a
+    # quiet onset, a decaying tail, a deliberately breathy phrase - and the
+    # level reference is then measured over exactly what was demonstrated.
+    # Whole-body takes are different: the hands-together hold starts the take
+    # and then you walk back into position, so they carry dead stretches the
+    # performer cannot avoid, and those still have to go.
+    if space == "xy":
+        sung = np.ones(n_frames, bool)
+    else:
+        sung = (loud > float(loud_threshold) if loud_threshold is not None
+                else voiced_mask(loud))
 
     # Crop to the sung span before the expensive part.
     #
@@ -280,9 +291,8 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
     # The threshold came from the front end, measured off the room during the
     # hold gesture: it is what the live indicator was showing while you sang,
     # so what gets dropped is exactly what you were told would be dropped.
-    # Without one (the x,y modality has no hold gesture) `sung` fell back to
-    # splitting the take's own loudness distribution. Either way it is the same
-    # mask the performed level was measured over, above.
+    # In x,y mode `sung` is all-true and nothing is dropped here. Either way it
+    # is the same mask the performed level was measured over, above.
     keep = sung[:len(t)]
     dropped = int(len(keep) - keep.sum())
     if keep.sum() >= 6:                         # unless that leaves nothing to fit

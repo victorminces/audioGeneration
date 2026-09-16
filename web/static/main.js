@@ -121,6 +121,7 @@ async function setSpace(next) {
     ? "whole body — bring your hands together for 3s to start recording"
     : "x,y — hold LEFT + sing to demonstrate · hold RIGHT to play");
   spaceBtn.textContent = space === "body" ? "mode: whole body" : "mode: x,y";
+  syncGate();
   legendEl.innerHTML = LEGENDS[space];
 }
 
@@ -292,14 +293,31 @@ function calibrateFloor() {
   calSamples = [];
 }
 
-// is what the mic hears right now loud enough to be learned?
-const capturing = () => micLoud > micThreshold();
+// Is what the mic hears right now going into the map?
+// In x,y the answer is always yes while a take is running: the gesture
+// delimits the take, so there is no gate to fall under. Only whole-body takes,
+// which cannot avoid dead stretches, are gated on level.
+const gated = () => space !== "xy";
+const capturing = () => !gated() || micLoud > micThreshold();
 
 // Placed here deliberately: this reads floorMargin and DB_PER_LN, which are
 // declared just above. Wired up higher with the other sliders it would throw
 // at load — and a top-level throw takes every declaration below it with it.
 const gateEl = document.getElementById("gate"), gateV = document.getElementById("gatev");
 floorMargin = (+gateEl.value) / DB_PER_LN;
+// x,y takes are ungated, so the slider has nothing to act on there.
+function syncGate() {
+  gateEl.disabled = !gated();
+  const lab = gateEl.closest("label");
+  if (lab) {
+    lab.style.opacity = gated() ? "" : "0.4";
+    lab.title = gated() ? "how far above the room's noise floor counts as singing"
+                        : "x,y takes are delimited by the drag, so nothing is gated";
+  }
+  gateV.textContent = gated() ? `${gateEl.value} dB` : "off";
+}
+syncGate();
+
 gateEl.addEventListener("input", () => {
   gateV.textContent = `${gateEl.value} dB`;
   floorMargin = (+gateEl.value) / DB_PER_LN;     // takes effect on the meter at once
@@ -342,10 +360,14 @@ async function uploadTake(audio) {
   }
   const secs = audio.length / audioCtx.sampleRate;
   // + 0.5 for the margin the server keeps around the sung span
-  const willAnalyse = Math.min(secs, takeVoicedS + 0.5);
+  // Ungated takes are analysed whole, so the wait is the take, not the part
+  // of it that was above a threshold.
+  const willAnalyse = gated() ? Math.min(secs, takeVoicedS + 0.5) : secs;
   analysing = { t0: performance.now(),
                 estMs: Math.max(400, willAnalyse * ANALYSE_MS_PER_S) };
-  setStatus(`analyzing ${willAnalyse.toFixed(1)}s sung of ${secs.toFixed(1)}s…`);
+  setStatus(gated()
+    ? `analyzing ${willAnalyse.toFixed(1)}s sung of ${secs.toFixed(1)}s…`
+    : `analyzing ${secs.toFixed(1)}s…`);
   const fd = new FormData();
   fd.append("audio", new Blob([audio.buffer], { type: "application/octet-stream" }));
   fd.append("cursor", JSON.stringify(cur));
@@ -1109,8 +1131,10 @@ function drawMicMeter(x, y, w) {
   ctx2d.fillRect(x, y, at(micLoud) * w, h);
   ctx2d.fillStyle = "rgba(120,200,255,0.55)";   // the measured room floor
   ctx2d.fillRect(x + at(micFloor()) * w - 1, y, 2, h);
-  ctx2d.fillStyle = "#ffffff";                  // the gate, moved by the slider
-  ctx2d.fillRect(x + at(micThreshold()) * w - 1, y - 2, 2, h + 4);
+  if (gated()) {                                // no marker where there is no gate
+    ctx2d.fillStyle = "#ffffff";                // the gate, moved by the slider
+    ctx2d.fillRect(x + at(micThreshold()) * w - 1, y - 2, 2, h + 4);
+  }
   ctx2d.restore();
 }
 
