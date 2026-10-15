@@ -54,8 +54,9 @@ async function postConfig(fields) {
   const fd = new FormData();
   for (const [k, v] of Object.entries(fields)) fd.append(k, String(v));
   try {
-    state = await fetch("/api/config", { method: "POST", body: fd }).then(r => r.json());
-    sendMap();
+    const r = await fetch("/api/config", { method: "POST", body: fd }).then(r => r.json());
+    state = { ...state, ...r };                // reply leaves out the face map
+    sendMap(false);
   } catch (err) {
     setStatus("server error: " + err.message);
   }
@@ -84,7 +85,7 @@ async function boot() {
 
   audioCtx = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
   // cache-bust: addModule ignores hard-refresh, so pin the worklet version
-  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=5");
+  await audioCtx.audioWorklet.addModule("/static/worklet.js?v=6");
   node = new AudioWorkletNode(audioCtx, "instrument", {
     numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { manifest, weights: weightsBuf, constants: manifest.constants },
@@ -93,7 +94,6 @@ async function boot() {
   node.connect(audioCtx.destination);
 
   sendMap();
-  node.port.postMessage({ type: "face", on: camKind === "face" });   // camera may be on already
   syncControls();
   hud();
   setStatus("allow the microphone to demonstrate…");
@@ -109,11 +109,12 @@ async function boot() {
   }
 }
 
-function sendMap() {
-  node.port.postMessage({ type: "map", points: state.points, mode: state.mode,
-                          sigma: state.sigma, sigmaPar: state.sigma_par,
-                          facePoints: state.face_points, faceScale: state.face_scale,
-                          faceSigma: state.face_sigma });
+// withFace=false skips the (large) face map when it hasn't changed
+function sendMap(withFace = true) {
+  const m = { type: "map", points: state.points, mode: state.mode,
+              sigma: state.sigma, sigmaPar: state.sigma_par, faceSigma: state.face_sigma };
+  if (withFace) { m.facePoints = state.face_points; m.faceScale = state.face_scale; }
+  node.port.postMessage(m);
 }
 
 function onWorklet(m) {
@@ -137,9 +138,13 @@ async function uploadTake(audio) {
     const r = await fetch("/api/take", { method: "POST", body: fd }).then(r => r.json());
     if (r.ok) {
       state = r;
-      demoPaths.push(r.path);
       sendMap();
-      setStatus(`map updated: ${r.seconds.toFixed(1)}s total (${demoPaths.length} takes)`);
+      if (r.face_take) {
+        setStatus(`face sound learned: ${r.seconds.toFixed(1)}s taught in total`);
+      } else {
+        demoPaths.push(r.path);
+        setStatus(`map updated: ${r.seconds.toFixed(1)}s total (${demoPaths.length} takes)`);
+      }
     } else {
       setStatus(r.reason || "take rejected");
     }
@@ -169,6 +174,8 @@ function startTake(kind, byCam) {
   takeT0 = performance.now();
   cursor = [[0, pos.x, pos.y, ...faceRow()]];
   mode = kind;
+  const byFace = camKind === "face" && byCam;
+  node.port.postMessage({ type: "face", on: byFace });   // mouse play uses the pad map
   if (kind === "demo") {
     livePath = [[pos.x, pos.y]];
     node.port.postMessage({ type: "record", on: true });
@@ -176,12 +183,9 @@ function startTake(kind, byCam) {
                                  : "RECORDING — sing and move…");
   } else {
     node.port.postMessage({ type: "gate", on: true });
-    const byFace = camKind === "face";
-    const ready = byFace ? state.face_points : state.points;
-    setStatus(ready ? (byFace ? "LIVE — make a taught face and it sounds"
-                              : "LIVE — sound follows the cursor")
-                    : (byFace ? "nothing taught by face yet — hold SPACE and make a sound"
-                              : "no map yet — demonstrate first (left-drag + sing)"));
+    if (byFace) return;                      // face play is always on: stay quiet
+    setStatus(state.points ? "LIVE — sound follows the cursor"
+                           : "no map yet — demonstrate first (left-drag + sing)");
   }
 }
 
@@ -192,7 +196,7 @@ function endTake() {
     livePath = [];
   } else if (mode === "trace") {
     node.port.postMessage({ type: "gate", on: false });
-    setStatus("released");
+    if (!(camDriving && camKind === "face")) setStatus("released");
   }
   mode = "idle";
   camDriving = false;
@@ -214,6 +218,7 @@ function moveTo(p) {
 }
 
 canvas.addEventListener("pointerdown", (ev) => {
+  if (mode === "trace" && camDriving && camKind === "face") endTake();   // mouse wins
   if (mode !== "idle") return;
   canvas.setPointerCapture(ev.pointerId);
   pos = toUnit(ev);
@@ -415,7 +420,7 @@ function calibStep(t) {
   const again = faceCalibrated;
   faceCal = r;
   faceCalibrated = true;
-  setStatus(again && state.points
+  setStatus(again && state.face_points
     ? "recalibrated — the chart moved; the sounds still follow your face"
     : "chart calibrated — hold SPACE and make a sound to teach it");
 }
@@ -454,7 +459,7 @@ function faceStep(res, t) {
 // taken by another app, Windows power-saving) is reopened automatically.
 let trackerErrors = 0;
 let trackerFixing = false;
-let forceCPU = false;
+const forceCPU = { hand: false, face: false };
 let lastFrameAt = 0;            // performance.now() of the last new video frame
 let lastDetectTs = 0;           // MediaPipe needs strictly increasing timestamps
 let reconnecting = false;
@@ -519,7 +524,7 @@ async function rebuildTracker(kind) {
   if (mode !== "idle" && camDriving) endTake();
   try { (kind === "face" ? faceLandmarker : handLandmarker).close(); } catch (e) {}
   if (kind === "face") faceLandmarker = null; else handLandmarker = null;
-  forceCPU = true;                           // the GPU path is what failed
+  forceCPU[kind] = true;                     // the GPU path is what failed
   try {
     await loadTracker(kind);
     trackerErrors = 0;
@@ -542,7 +547,12 @@ async function reconnectCamera() {
   let ok = false;
   for (let i = 0; i < CAM_RECONNECT_TRIES && camOn && camKind === kind; i++) {
     try {
-      camStream = await openCamera();
+      const stream = await openCamera();
+      if (!camOn || camKind !== kind) {       // switched off/over meanwhile
+        stream.getTracks().forEach((t) => t.stop());
+        break;
+      }
+      camStream = stream;
       video.srcObject = camStream;
       await video.play();
       lastVideoTime = -1;
@@ -578,7 +588,7 @@ async function loadTracker(kind) {
   // provide it, so tracking still works rather than failing outright.
   const Task_CPU = (Task, opts) => Task.createFromOptions(visionFiles, opts("CPU"));
   const create = async (Task, opts) => {
-    if (forceCPU) return await Task_CPU(Task, opts);
+    if (forceCPU[kind]) return await Task_CPU(Task, opts);
     try {
       return await Task.createFromOptions(visionFiles, opts("GPU"));
     } catch (gpuErr) {
@@ -651,7 +661,7 @@ async function setCamera(kind) {
   camKind = "off";
   camGesture = null; face = null; faceVec = null; calib = null;
   legendEl.innerHTML = LEGEND_POINTER;
-  if (node) node.port.postMessage({ type: "face", on: kind === "face" });
+  if (node) node.port.postMessage({ type: "face", on: false });
   if (kind === "off") { stopStream(); return; }
   camSel.disabled = true;
   try {
@@ -703,7 +713,8 @@ window.addEventListener("pagehide", () => { camOn = false; stopStream(); });
 // C = redo the face calibration.
 let spaceTake = false;
 window.addEventListener("keydown", (ev) => {
-  if (ev.code === "KeyC" && camKind === "face" && !ev.repeat) {
+  if (ev.code === "KeyC" && camKind === "face" && !ev.repeat &&
+      !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
     startCalibration();
     return;
   }

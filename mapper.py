@@ -142,6 +142,7 @@ class FeatureMapper:
 
     def __init__(self):
         self.sigma = 1.0
+        self.seconds = 0.0
         self.data_f = []
         self.data_t = []
         self.F = None                           # (M, D) normalized features
@@ -152,9 +153,11 @@ class FeatureMapper:
     def ready(self):
         return self.F is not None
 
-    def add(self, feats, targets):
+    def add(self, feats, targets, seconds=0.0):
         if self.data_f and feats.shape[1] != self.data_f[0].shape[1]:
             self.data_f, self.data_t = [], []   # feature set changed: start over
+            self.seconds = 0.0
+        self.seconds += seconds
         self.data_f.append(feats)
         self.data_t.append(targets)
         self.refit()

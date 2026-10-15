@@ -37,6 +37,7 @@ print(f"model: {MODEL_NAME}", flush=True)
 
 MAPPER = KernelMapper()
 FACE = FeatureMapper()                          # face-shape vector -> voice
+FACE_GAP = 0.25                                 # s: max distance to a face row
 LOCK = threading.Lock()
 
 # decoder weights, flattened once in a fixed order the worklet knows
@@ -61,8 +62,10 @@ WEIGHTS_BLOB = np.concatenate(_chunks).tobytes()
 app = FastAPI()
 
 
-def state_json():
-    return {
+def state_json(face=True):
+    """face=False leaves out face_points/face_scale (up to 4000 x 39 floats)
+    for replies where they can't have changed; the client keeps its copy."""
+    st = {
         # one row per thinned sample: [x, y, ux, uy, log_f0, loud, z_1..z_16]
         # (ux, uy) = unit tangent of the stroke there; (0, 0) = no direction
         "points": (np.concatenate([MAPPER.S, MAPPER.U, MAPPER.T], axis=1).tolist()
@@ -70,15 +73,17 @@ def state_json():
         "mode": MAPPER.mode,
         "sigma": MAPPER.sigma,
         "sigma_par": MAPPER.sigma_par,
-        "seconds": MAPPER.seconds,
+        "seconds": MAPPER.seconds + FACE.seconds,
         "model": MODEL_NAME,
-        # face takes also land here: one row per frame, [f_1..f_D (normalized),
-        # log_f0, loud, z_1..z_16]; live features are divided by face_scale
-        "face_points": (np.concatenate([FACE.F, FACE.T], axis=1).tolist()
-                        if FACE.ready else None),
-        "face_scale": FACE.scale.tolist() if FACE.ready else None,
         "face_sigma": FACE.sigma,
     }
+    if face:
+        # face takes land here: one row per frame, [f_1..f_D (normalized),
+        # log_f0, loud, z_1..z_16]; live features are divided by face_scale
+        st["face_points"] = (np.concatenate([FACE.F, FACE.T], axis=1).tolist()
+                             if FACE.ready else None)
+        st["face_scale"] = FACE.scale.tolist() if FACE.ready else None
+    return st
 
 
 @app.get("/api/decoder/manifest")
@@ -130,12 +135,31 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
     t = t[t <= cur[-1, 0]]                      # audio may outlast cursor
     xy = np.stack([np.interp(t, cur[:, 0], cur[:, 1]),
                    np.interp(t, cur[:, 0], cur[:, 2])], axis=1)
+    tg = targets[:len(t)]
+    if width > 3:
+        # face take: it teaches the face map only (its x, y is just the chart
+        # picture of the face, not a place on the pad). Audio frames with no
+        # tracked face within FACE_GAP s (face lost, or before/after it was
+        # seen) are dropped instead of inheriting the nearest face's key.
+        if len(face_rows) < 6:
+            with LOCK:
+                return {"ok": False, "reason": "no face seen during the take — "
+                        "keep your face in view while teaching", **state_json(face=False)}
+        ft = face_rows[:, 0]
+        k = np.clip(np.searchsorted(ft, t), 1, len(ft) - 1)
+        near = np.minimum(np.abs(t - ft[k - 1]), np.abs(ft[k] - t))
+        keep = near <= FACE_GAP
+        if keep.sum() < 6:
+            with LOCK:
+                return {"ok": False, "reason": "face lost during the take",
+                        **state_json(face=False)}
+        feats = np.stack([np.interp(t[keep], ft, face_rows[:, j])
+                          for j in range(3, width)], axis=1)
+        with LOCK:
+            FACE.add(feats, tg[keep], seconds=keep.sum() * ddsp.HOP / ddsp.SR)
+            return {"ok": True, "face_take": True, "path": [], **state_json()}
     with LOCK:
-        MAPPER.add(xy, targets[:len(t)], seconds=len(wav) / ddsp.SR)
-        if width > 3 and len(face_rows) >= 6:
-            feats = np.stack([np.interp(t, face_rows[:, 0], face_rows[:, j])
-                              for j in range(3, width)], axis=1)
-            FACE.add(feats, targets[:len(t)])
+        MAPPER.add(xy, tg, seconds=len(wav) / ddsp.SR)
         return {"ok": True, "path": xy.tolist(), **state_json()}
 
 
@@ -151,7 +175,7 @@ def post_config(mode: str = Form(None), sigma: float = Form(None),
             MAPPER.sigma_par = float(np.clip(sigma_par, 0.01, 0.3))
         if face_sigma is not None:
             FACE.sigma = float(np.clip(face_sigma, 0.3, 4.0))
-        return state_json()
+        return state_json(face=False)
 
 
 @app.post("/api/clear")
