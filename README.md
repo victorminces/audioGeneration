@@ -13,6 +13,37 @@ Open `http://127.0.0.1:8321` (see Running, below) and:
 - **Play**: move the cursor/hand through that space; the instrument
   synthesizes pitch/timbre/loudness for wherever you are, continuously.
 
+### Face mode (any sound from your face)
+
+Pick **camera: face** and your face becomes the controller. The sound is
+picked by the **whole mouth shape**: every mouth/jaw blendshape from MediaPipe's
+`FaceLandmarker` (jaw open, pucker, funnel, smile, press, roll, cheek puff, …)
+plus the lip gap and mouth width, about 19 numbers in all. Whatever sound you
+made with a given face comes back when you make that face again.
+
+1. **Teach**: hold **SPACE** and make a sound: a vowel, a hum, "mmm", "sss",
+   "shh", a lip buzz, a sung note. Hold the face steady for a second or two
+   while you do it. Repeat for as many sounds as you like. Teach **silence**
+   too: hold SPACE with a relaxed, closed mouth and stay quiet, so resting your
+   face is silent.
+2. **Play**: make the faces silently. The instrument plays back the taught
+   sound whose face is closest. Faces unlike anything taught fade to silence.
+   The **face match** slider sets how close counts as a match (wider = more
+   blending between taught sounds).
+
+In face mode the pad shows your camera image with clean outlines of the parts
+that shape sound, each brightening as it moves: lips (pinker when rounded),
+jaw line and cheeks, with small live labels. A red frame means you're recording. SPACE-to-teach also works with the mouse or hand modes.
+
+What it can't do: the camera only sees the outside of the mouth. Sounds that
+differ only inside (tongue: "t" vs. "k"; voicing: "p" vs. "b", "s" vs. "z")
+look the same and get confused. Pitch isn't visible either, so each face
+plays back the pitch you taught it with. Each face is a held *pose*, so
+sustained sounds work best. Quick moving sounds like "p" or whole words blur.
+The shipped DDSP model was trained on speech. If distinct sounds come back too
+alike, retrain on recordings closer to what you'll teach (see "Training the
+DDSP model").
+
 ## Running
 
 ```bash
@@ -35,7 +66,9 @@ no training required to get started.
   (the kernel weight at the nearest sample) fades the instrument to silence
   away from anything you've taught it. Two kernel modes: isotropic (round) or
   anisotropic (narrow along the stroke direction, wide across it, so
-  consecutive sounds in a stroke don't blur together).
+  consecutive sounds in a stroke don't blur together). Face takes also feed a
+  `FeatureMapper`: the same kernel smoothing, but over the ~19-number face-shape
+  vector (each number scaled by its spread in the taught data) instead of (x, y).
 - **Voice synthesis** ([ddsp.py](ddsp.py)): a DDSP model (Engel et al., ICLR
   2020) — harmonic-plus-noise synthesis from per-frame (f0, loudness, timbre
   latent z). Trained end-to-end through the synthesizer with a multi-scale
@@ -47,12 +80,14 @@ no training required to get started.
 Everything real-time runs in the browser, not the server:
 
 - **`index.html`** — page shell and controls (kernel mode selector, sigma
-  sliders, camera/clear buttons).
-- **`main.js`** — orchestrates everything outside the audio thread: mouse and
-  MediaPipe `HandLandmarker` gesture input (hand tracking loaded from a CDN;
-  the model file itself, `models/hand_landmarker.task`, is served locally by
-  the backend via `/api/hand_model`), the "sing to teach" recording flow
-  (posts audio + cursor path to `/api/take`), and drawing the on-screen path.
+  sliders, camera off/hand/face selector, clear button).
+- **`main.js`** — orchestrates everything outside the audio thread: mouse,
+  MediaPipe `HandLandmarker` gesture input and `FaceLandmarker` mouth-shape
+  input (the tracking library is loaded from a CDN; the model files
+  `models/hand_landmarker.task` and `models/face_landmarker.task` are served
+  locally via `/api/hand_model` and `/api/face_model`), the face-shape vector
+  and chart calibration, the "sing to teach" recording flow (posts audio + cursor path to `/api/take`),
+  and drawing the on-screen path, face mesh and mouth bars.
 - **`worklet.js`** — an `AudioWorklet` that runs the gesture-map evaluation
   *and* the DDSP decoder directly in the audio callback, sample-accurate and
   glitch-free. It fetches the decoder weights once from `/api/decoder/weights`

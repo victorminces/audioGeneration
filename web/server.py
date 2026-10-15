@@ -7,6 +7,8 @@ in an AudioWorklet). This server only:
   GET  /api/state              current mapper state (W, sigma, seconds)
   POST /api/take               demonstration audio + cursor -> refit -> new W
   POST /api/clear              reset the mapper
+  GET  /api/hand_model         MediaPipe hand landmarker model file
+  GET  /api/face_model         MediaPipe face landmarker model file
 
 Run:  uvicorn server:app --port 8321      (from web/, or python server.py)
 """
@@ -25,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJ)
 import ddsp                                     # noqa: E402
-from mapper import KernelMapper, load_latest_ddsp  # noqa: E402
+from mapper import KernelMapper, FeatureMapper, load_latest_ddsp  # noqa: E402
 
 torch.set_num_threads(2)
 
@@ -34,6 +36,7 @@ MODEL, MODEL_NAME = load_latest_ddsp(PROJ)
 print(f"model: {MODEL_NAME}", flush=True)
 
 MAPPER = KernelMapper()
+FACE = FeatureMapper()                          # face-shape vector -> voice
 LOCK = threading.Lock()
 
 # decoder weights, flattened once in a fixed order the worklet knows
@@ -69,6 +72,12 @@ def state_json():
         "sigma_par": MAPPER.sigma_par,
         "seconds": MAPPER.seconds,
         "model": MODEL_NAME,
+        # face takes also land here: one row per frame, [f_1..f_D (normalized),
+        # log_f0, loud, z_1..z_16]; live features are divided by face_scale
+        "face_points": (np.concatenate([FACE.F, FACE.T], axis=1).tolist()
+                        if FACE.ready else None),
+        "face_scale": FACE.scale.tolist() if FACE.ready else None,
+        "face_sigma": FACE.sigma,
     }
 
 
@@ -96,10 +105,14 @@ def get_state():
 
 @app.post("/api/take")
 async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(...)):
-    """audio: raw little-endian float32 mono; cursor: JSON [[t,x,y],...]."""
+    """audio: raw little-endian float32 mono; cursor: JSON [[t,x,y],...].
+    Face takes append the face-shape vector: [[t,x,y,f_1..f_D],...]."""
     raw = await audio.read()
     wav = np.frombuffer(raw, dtype=np.float32).copy()
-    cur = np.array(json.loads(cursor), dtype=np.float64)
+    rows = json.loads(cursor)
+    cur = np.array([r[:3] for r in rows], dtype=np.float64)
+    width = max((len(r) for r in rows), default=3)
+    face_rows = np.array([r for r in rows if len(r) == width], dtype=np.float64)
     if sr != ddsp.SR:
         import torchaudio.functional as AF
         wav = AF.resample(torch.from_numpy(wav).unsqueeze(0), sr, ddsp.SR)[0].numpy()
@@ -119,12 +132,16 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
                    np.interp(t, cur[:, 0], cur[:, 2])], axis=1)
     with LOCK:
         MAPPER.add(xy, targets[:len(t)], seconds=len(wav) / ddsp.SR)
+        if width > 3 and len(face_rows) >= 6:
+            feats = np.stack([np.interp(t, face_rows[:, 0], face_rows[:, j])
+                              for j in range(3, width)], axis=1)
+            FACE.add(feats, targets[:len(t)])
         return {"ok": True, "path": xy.tolist(), **state_json()}
 
 
 @app.post("/api/config")
 def post_config(mode: str = Form(None), sigma: float = Form(None),
-                sigma_par: float = Form(None)):
+                sigma_par: float = Form(None), face_sigma: float = Form(None)):
     with LOCK:
         if mode in ("iso", "aniso"):
             MAPPER.mode = mode
@@ -132,14 +149,17 @@ def post_config(mode: str = Form(None), sigma: float = Form(None),
             MAPPER.sigma = float(np.clip(sigma, 0.03, 0.6))
         if sigma_par is not None:
             MAPPER.sigma_par = float(np.clip(sigma_par, 0.01, 0.3))
+        if face_sigma is not None:
+            FACE.sigma = float(np.clip(face_sigma, 0.3, 4.0))
         return state_json()
 
 
 @app.post("/api/clear")
 def post_clear():
-    global MAPPER
+    global MAPPER, FACE
     with LOCK:
         MAPPER = KernelMapper()
+        FACE = FeatureMapper()
         return state_json()
 
 
@@ -149,6 +169,12 @@ STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 @app.get("/api/hand_model")
 def hand_model():
     return FileResponse(os.path.join(PROJ, "models", "hand_landmarker.task"),
+                        media_type="application/octet-stream")
+
+
+@app.get("/api/face_model")
+def face_model():
+    return FileResponse(os.path.join(PROJ, "models", "face_landmarker.task"),
                         media_type="application/octet-stream")
 
 

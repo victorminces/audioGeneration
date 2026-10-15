@@ -40,6 +40,15 @@ class Instrument extends AudioWorkletProcessor {
     this.sigmaPar = 0.04;                    // along-stroke width (aniso mode)
     this.fade = 0.0;                         // confidence gain (silence off-data)
 
+    // face mapper: live face-shape vector -> voice (used while useFace)
+    this.fPts = null;                        // Float32Array, rows [f_1..f_D, 18 targets]
+    this.fN = 0;
+    this.fD = 0;
+    this.fScale = null;
+    this.fSigma = 1.0;
+    this.feat = null;                        // latest normalized face vector
+    this.useFace = false;
+
     // control state (written by messages, read by the render loop)
     this.x = 0.5; this.y = 0.5;
     this.gate = 0.0;
@@ -87,6 +96,27 @@ class Instrument extends AudioWorkletProcessor {
       } else {
         this.pts = null; this.nPts = 0;
       }
+      this.fSigma = m.faceSigma;
+      if (m.facePoints && m.facePoints.length) {
+        this.fD = m.faceScale.length;
+        this.fScale = Float32Array.from(m.faceScale);
+        const stride = this.fD + this.nOut;
+        this.fN = m.facePoints.length;
+        this.fPts = new Float32Array(this.fN * stride);
+        for (let i = 0; i < this.fN; i++)
+          for (let j = 0; j < stride; j++)
+            this.fPts[i * stride + j] = m.facePoints[i][j];
+      } else {
+        this.fPts = null; this.fN = 0; this.fScale = null;
+      }
+      this.feat = null;                      // re-normalize with the new scale
+    } else if (m.type === "face") {
+      this.useFace = m.on;
+    } else if (m.type === "feat") {
+      if (this.fScale && m.f.length === this.fD) {
+        const f = this.feat || (this.feat = new Float32Array(this.fD));
+        for (let j = 0; j < this.fD; j++) f[j] = m.f[j] / this.fScale[j];
+      }
     } else if (m.type === "pos") {
       this.x = m.x; this.y = m.y;
     } else if (m.type === "gate") {
@@ -131,6 +161,30 @@ class Instrument extends AudioWorkletProcessor {
     const inv = 1 / (sw + 1e-12);
     for (let j = 0; j < this.nOut; j++) out[j] *= inv;
     return wmax;
+  }
+
+  // Face version: round Gaussian over the normalized face-shape vector. The
+  // confidence saturates at 1 within ~1.5 sigma of the nearest taught frame
+  // (face tracking jitters in every dimension, so exact hits never happen).
+  predictFace(out) {
+    const s2 = 2 * this.fSigma * this.fSigma;
+    const D = this.fD, stride = D + this.nOut, P = this.fPts, f = this.feat;
+    out.fill(0);
+    let sw = 0, wmax = 0;
+    for (let i = 0; i < this.fN; i++) {
+      const o = i * stride;
+      let d2 = 0;
+      for (let j = 0; j < D; j++) { const d = f[j] - P[o + j]; d2 += d * d; }
+      const w = Math.exp(-d2 / s2);
+      if (w < 1e-6) continue;
+      sw += w;
+      if (w > wmax) wmax = w;
+      for (let j = 0; j < this.nOut; j++) out[j] += w * P[o + D + j];
+    }
+    if (sw === 0) return 0;
+    const inv = 1 / sw;
+    for (let j = 0; j < this.nOut; j++) out[j] *= inv;
+    return Math.min(1, wmax / 0.3);
   }
 
   // ── decoder ───────────────────────────────────────────────────────────────
@@ -234,7 +288,8 @@ class Instrument extends AudioWorkletProcessor {
     let newGain = this.gain + 0.35 * (this.gate - this.gain);   // ~50 ms ramp
     if (newGain < 1e-3 && this.gate === 0) newGain = 0;
 
-    if (newGain <= 0 || !this.pts) {
+    const face = this.useFace;
+    if (newGain <= 0 || (face ? !(this.fPts && this.feat) : !this.pts)) {
       this.gain = newGain;
       this.fade = 0;
       this.resetSynth();
@@ -242,7 +297,7 @@ class Instrument extends AudioWorkletProcessor {
     }
 
     const p = this._p;
-    const conf = this.predict(p);
+    const conf = face ? this.predictFace(p) : this.predict(p);
     const f0 = Math.min(600, Math.max(60, Math.exp(p[0])));
     const amp = this.decodeFrame(f0, p[1], p.subarray(2));
     const harm = this._harm, H = this.C.N_HARMONICS;
