@@ -127,6 +127,55 @@ class KernelMapper:
         return str(z["ddsp_name"])
 
 
+class FeatureMapper:
+    """Kernel smoothing from a face-shape vector (D mouth/jaw measurements)
+    to the same voice parameters as KernelMapper — any sound, not just a 2D
+    chart: whatever was sung with a given mouth shape comes back at that shape.
+
+    Each feature is divided by its spread over the taught data (floored, so a
+    barely-moving feature can't turn jitter into distance), then a round
+    Gaussian of width sigma works in that normalized space. Samples are kept
+    per frame (no spatial bins in D dimensions), uniformly thinned past MAX_N.
+    """
+    MAX_N = 4000
+    SCALE_FLOOR = 0.03
+
+    def __init__(self):
+        self.sigma = 1.0
+        self.seconds = 0.0
+        self.data_f = []
+        self.data_t = []
+        self.F = None                           # (M, D) normalized features
+        self.T = None                           # (M, N_OUT) targets
+        self.scale = None                       # (D,) per-feature divisor
+
+    @property
+    def ready(self):
+        return self.F is not None
+
+    def add(self, feats, targets, seconds=0.0):
+        if self.data_f and feats.shape[1] != self.data_f[0].shape[1]:
+            self.data_f, self.data_t = [], []   # feature set changed: start over
+            self.seconds = 0.0
+        self.seconds += seconds
+        self.data_f.append(feats)
+        self.data_t.append(targets)
+        self.refit()
+
+    def refit(self):
+        if not self.data_f:
+            self.F = self.T = self.scale = None
+            return
+        f = np.concatenate(self.data_f)
+        t = np.concatenate(self.data_t)
+        self.scale = np.maximum(f.std(axis=0), self.SCALE_FLOOR)
+        if len(f) > self.MAX_N:
+            keep = np.linspace(0, len(f) - 1, self.MAX_N).astype(np.int64)
+            f, t = f[keep], t[keep]
+        self.F = f / self.scale
+        self.T = t
+
+
 def load_latest_ddsp(proj=None):
     proj = proj or os.path.dirname(os.path.abspath(__file__))
     cfgs = []

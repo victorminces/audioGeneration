@@ -7,6 +7,8 @@ in an AudioWorklet). This server only:
   GET  /api/state              current mapper state (W, sigma, seconds)
   POST /api/take               demonstration audio + cursor -> refit -> new W
   POST /api/clear              reset the mapper
+  GET  /api/hand_model         MediaPipe hand landmarker model file
+  GET  /api/face_model         MediaPipe face landmarker model file
 
 Run:  uvicorn server:app --port 8321      (from web/, or python server.py)
 """
@@ -25,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJ)
 import ddsp                                     # noqa: E402
-from mapper import KernelMapper, load_latest_ddsp  # noqa: E402
+from mapper import KernelMapper, FeatureMapper, load_latest_ddsp  # noqa: E402
 
 torch.set_num_threads(2)
 
@@ -34,6 +36,8 @@ MODEL, MODEL_NAME = load_latest_ddsp(PROJ)
 print(f"model: {MODEL_NAME}", flush=True)
 
 MAPPER = KernelMapper()
+FACE = FeatureMapper()                          # face-shape vector -> voice
+FACE_GAP = 0.25                                 # s: max distance to a face row
 LOCK = threading.Lock()
 
 # decoder weights, flattened once in a fixed order the worklet knows
@@ -58,8 +62,10 @@ WEIGHTS_BLOB = np.concatenate(_chunks).tobytes()
 app = FastAPI()
 
 
-def state_json():
-    return {
+def state_json(face=True):
+    """face=False leaves out face_points/face_scale (up to 4000 x 39 floats)
+    for replies where they can't have changed; the client keeps its copy."""
+    st = {
         # one row per thinned sample: [x, y, ux, uy, log_f0, loud, z_1..z_16]
         # (ux, uy) = unit tangent of the stroke there; (0, 0) = no direction
         "points": (np.concatenate([MAPPER.S, MAPPER.U, MAPPER.T], axis=1).tolist()
@@ -67,9 +73,17 @@ def state_json():
         "mode": MAPPER.mode,
         "sigma": MAPPER.sigma,
         "sigma_par": MAPPER.sigma_par,
-        "seconds": MAPPER.seconds,
+        "seconds": MAPPER.seconds + FACE.seconds,
         "model": MODEL_NAME,
+        "face_sigma": FACE.sigma,
     }
+    if face:
+        # face takes land here: one row per frame, [f_1..f_D (normalized),
+        # log_f0, loud, z_1..z_16]; live features are divided by face_scale
+        st["face_points"] = (np.concatenate([FACE.F, FACE.T], axis=1).tolist()
+                             if FACE.ready else None)
+        st["face_scale"] = FACE.scale.tolist() if FACE.ready else None
+    return st
 
 
 @app.get("/api/decoder/manifest")
@@ -96,10 +110,14 @@ def get_state():
 
 @app.post("/api/take")
 async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(...)):
-    """audio: raw little-endian float32 mono; cursor: JSON [[t,x,y],...]."""
+    """audio: raw little-endian float32 mono; cursor: JSON [[t,x,y],...].
+    Face takes append the face-shape vector: [[t,x,y,f_1..f_D],...]."""
     raw = await audio.read()
     wav = np.frombuffer(raw, dtype=np.float32).copy()
-    cur = np.array(json.loads(cursor), dtype=np.float64)
+    rows = json.loads(cursor)
+    cur = np.array([r[:3] for r in rows], dtype=np.float64)
+    width = max((len(r) for r in rows), default=3)
+    face_rows = np.array([r for r in rows if len(r) == width], dtype=np.float64)
     if sr != ddsp.SR:
         import torchaudio.functional as AF
         wav = AF.resample(torch.from_numpy(wav).unsqueeze(0), sr, ddsp.SR)[0].numpy()
@@ -117,14 +135,37 @@ async def post_take(audio: UploadFile, cursor: str = Form(...), sr: int = Form(.
     t = t[t <= cur[-1, 0]]                      # audio may outlast cursor
     xy = np.stack([np.interp(t, cur[:, 0], cur[:, 1]),
                    np.interp(t, cur[:, 0], cur[:, 2])], axis=1)
+    tg = targets[:len(t)]
+    if width > 3:
+        # face take: it teaches the face map only (its x, y is just the chart
+        # picture of the face, not a place on the pad). Audio frames with no
+        # tracked face within FACE_GAP s (face lost, or before/after it was
+        # seen) are dropped instead of inheriting the nearest face's key.
+        if len(face_rows) < 6:
+            with LOCK:
+                return {"ok": False, "reason": "no face seen during the take — "
+                        "keep your face in view while teaching", **state_json(face=False)}
+        ft = face_rows[:, 0]
+        k = np.clip(np.searchsorted(ft, t), 1, len(ft) - 1)
+        near = np.minimum(np.abs(t - ft[k - 1]), np.abs(ft[k] - t))
+        keep = near <= FACE_GAP
+        if keep.sum() < 6:
+            with LOCK:
+                return {"ok": False, "reason": "face lost during the take",
+                        **state_json(face=False)}
+        feats = np.stack([np.interp(t[keep], ft, face_rows[:, j])
+                          for j in range(3, width)], axis=1)
+        with LOCK:
+            FACE.add(feats, tg[keep], seconds=keep.sum() * ddsp.HOP / ddsp.SR)
+            return {"ok": True, "face_take": True, "path": [], **state_json()}
     with LOCK:
-        MAPPER.add(xy, targets[:len(t)], seconds=len(wav) / ddsp.SR)
+        MAPPER.add(xy, tg, seconds=len(wav) / ddsp.SR)
         return {"ok": True, "path": xy.tolist(), **state_json()}
 
 
 @app.post("/api/config")
 def post_config(mode: str = Form(None), sigma: float = Form(None),
-                sigma_par: float = Form(None)):
+                sigma_par: float = Form(None), face_sigma: float = Form(None)):
     with LOCK:
         if mode in ("iso", "aniso"):
             MAPPER.mode = mode
@@ -132,14 +173,17 @@ def post_config(mode: str = Form(None), sigma: float = Form(None),
             MAPPER.sigma = float(np.clip(sigma, 0.03, 0.6))
         if sigma_par is not None:
             MAPPER.sigma_par = float(np.clip(sigma_par, 0.01, 0.3))
-        return state_json()
+        if face_sigma is not None:
+            FACE.sigma = float(np.clip(face_sigma, 0.3, 4.0))
+        return state_json(face=False)
 
 
 @app.post("/api/clear")
 def post_clear():
-    global MAPPER
+    global MAPPER, FACE
     with LOCK:
         MAPPER = KernelMapper()
+        FACE = FeatureMapper()
         return state_json()
 
 
@@ -149,6 +193,12 @@ STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 @app.get("/api/hand_model")
 def hand_model():
     return FileResponse(os.path.join(PROJ, "models", "hand_landmarker.task"),
+                        media_type="application/octet-stream")
+
+
+@app.get("/api/face_model")
+def face_model():
+    return FileResponse(os.path.join(PROJ, "models", "face_landmarker.task"),
                         media_type="application/octet-stream")
 
 
